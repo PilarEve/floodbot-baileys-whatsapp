@@ -51,9 +51,12 @@ node bot.js
 *(Para detener el bot en cualquier momento: presionar `Ctrl + C`)*
 
 ### En Servidor Linux (Laboratorio)
+
+> 📖 Para la guía detallada paso a paso desde el clonado hasta el despliegue permanente (24/7), consultá [**INSTALACION.md**](INSTALACION.md).
+
 ```bash
 # 1. Navegar a la carpeta del proyecto
-cd ~/baileys-whatsapp
+cd ~/floodbot-baileys-whatsapp
 
 # 2. Instalar dependencias exactas
 npm ci --omit=dev
@@ -80,6 +83,7 @@ baileys-whatsapp/
 ├── .env                           # Credenciales secretas de Supabase (ignorado en Git)
 ├── .gitignore                     # Reglas estrictas de exclusión para control de versiones
 ├── bot.js                         # Código fuente central del bot (~600 líneas)
+├── INSTALACION.md                 # Guía paso a paso de instalación y despliegue en Linux
 ├── package.json                   # Dependencias de producción y scripts
 ├── package-lock.json              # Registro de versiones fijadas de librerías
 ├── README.md                      # Este documento
