@@ -29,7 +29,12 @@ const {
     getKeyAuthor
 } = require('@whiskeysockets/baileys')
 
-const { syncReportToSupabase, isSupabaseConfigured } = require('./supabaseClient')
+const {
+    uploadReportPhoto,
+    insertReportRecord,
+    syncReportToSupabase,
+    isSupabaseConfigured
+} = require('./supabaseClient')
 
 // Silenciar avisos criptográficos internos de bajo nivel de libsignal (SessionEntry, buffers)
 const _originalConsoleInfo = console.info
@@ -46,10 +51,10 @@ console.info = (...args) => {
     _originalConsoleInfo.apply(console, args)
 }
 
-// Directorios y persistencia local
-const AUTH_DIR = path.resolve(__dirname, 'auth_info_baileys')
-const UPLOADS_DIR = path.resolve(__dirname, 'uploads')
-const DB_PATH = path.resolve(__dirname, 'sessions.db')
+// Directorios y persistencia local (configurables por entorno para aislamiento de pruebas)
+const AUTH_DIR = process.env.AUTH_DIR || path.resolve(__dirname, 'auth_info_baileys')
+const UPLOADS_DIR = process.env.UPLOADS_DIR || path.resolve(__dirname, 'uploads')
+const DB_PATH = process.env.DB_PATH || path.resolve(__dirname, 'sessions.db')
 
 // Tiempo máximo de inactividad por usuario (30 minutos en milisegundos)
 const SESSION_TIMEOUT_MS = 30 * 60 * 1000
@@ -58,7 +63,7 @@ if (!fs.existsSync(UPLOADS_DIR)) {
     fs.mkdirSync(UPLOADS_DIR, { recursive: true })
 }
 
-// Inicialización de SQLite para gestión de estados conversacionales
+// Inicialización de SQLite para gestión de estados conversacionales y reportes pendientes
 const db = new Database(DB_PATH)
 db.exec(`
     CREATE TABLE IF NOT EXISTS report_sessions (
@@ -71,6 +76,23 @@ db.exec(`
         description TEXT,
         poll_msg_id TEXT,
         poll_enc_key TEXT,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS pending_sync_reports (
+        id TEXT PRIMARY KEY,
+        user_jid TEXT NOT NULL,
+        latitude REAL NOT NULL,
+        longitude REAL NOT NULL,
+        selected_affectations TEXT DEFAULT '[]',
+        photo_path TEXT,
+        description TEXT,
+        storage_url TEXT,
+        status TEXT DEFAULT 'PENDING',
+        attempts INTEGER DEFAULT 0,
+        last_error TEXT,
+        next_retry_at INTEGER DEFAULT 0,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
         updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
     );
 
@@ -124,23 +146,44 @@ function isSessionExpired(session) {
 function safeDeleteUploadFile(filePath) {
     if (!filePath || typeof filePath !== 'string') return false
     try {
-        const resolvedPath = path.resolve(filePath)
-        const resolvedUploads = path.resolve(UPLOADS_DIR)
-        // Seguridad: verificar que la ruta resuelta esté estrictamente dentro de uploads/
-        if (!resolvedPath.startsWith(resolvedUploads) || resolvedPath === resolvedUploads) {
-            addLog('warn', `Intento de eliminación fuera de uploads/ rechazado: ${resolvedPath}`)
+        if (!fs.existsSync(filePath)) return false
+
+        // Resolver directorio uploads canónico y destino canónico para evitar traversal y symlinks
+        const canonicalUploads = fs.realpathSync(UPLOADS_DIR)
+        const canonicalTarget = fs.realpathSync(filePath)
+
+        // Comprobar relación relativa estricta
+        const rel = path.relative(canonicalUploads, canonicalTarget)
+        const isInside = rel && !rel.startsWith('..') && !path.isAbsolute(rel)
+
+        if (!isInside) {
+            addLog('warn', `Intento de eliminación fuera de uploads/ rechazado: ${filePath} -> ${canonicalTarget}`)
             return false
         }
-        if (fs.existsSync(resolvedPath)) {
-            fs.unlinkSync(resolvedPath)
-            addLog('info', `🧹 Archivo temporal eliminado con seguridad: ${path.basename(resolvedPath)}`)
-            return true
+
+        const stat = fs.statSync(canonicalTarget)
+        if (stat.isDirectory()) {
+            addLog('warn', `Intento de eliminar un directorio rechazado: ${canonicalTarget}`)
+            return false
         }
+
+        fs.unlinkSync(canonicalTarget)
+        addLog('info', `🧹 Archivo temporal eliminado con seguridad: ${path.basename(canonicalTarget)}`)
+        return true
     } catch (err) {
         // Envoltorio seguro: nunca lanzar excepción ni detener el flujo del bot
         addLog('error', `Error controlado al intentar eliminar ${filePath}: ${err.message}`)
+        return false
     }
-    return false
+}
+
+// Elimina la sesión conversacional en SQLite SIN eliminar el archivo físico de fotografía
+function deleteSessionWithoutPhoto(userJid) {
+    try {
+        db.prepare('DELETE FROM report_sessions WHERE user_jid = ?').run(userJid)
+    } catch (err) {
+        addLog('error', `Error al eliminar sesión (sin foto) de ${userJid}: ${err.message}`)
+    }
 }
 
 // Elimina la sesión en SQLite y su foto temporal asociada (si existe) de forma segura
@@ -159,10 +202,11 @@ function deleteSession(userJid) {
 // Limpieza periódica y al inicio: elimina sesiones expiradas (>30 min) y fotos huérfanas en uploads/
 function cleanupExpiredSessionsAndFiles() {
     try {
-        const allSessions = db.prepare('SELECT user_jid, photo_path, updated_at FROM report_sessions').all()
         const activePhotoPaths = new Set()
         let expiredCount = 0
 
+        // 1. Sesiones de conversación activas
+        const allSessions = db.prepare('SELECT user_jid, photo_path, updated_at FROM report_sessions').all()
         for (const s of allSessions) {
             if (isSessionExpired(s)) {
                 if (s.photo_path) {
@@ -172,7 +216,9 @@ function cleanupExpiredSessionsAndFiles() {
                 expiredCount++
             } else if (s.photo_path) {
                 // Sesión activa: registrar su fotografía para que NUNCA sea eliminada
-                activePhotoPaths.add(path.resolve(s.photo_path))
+                try {
+                    activePhotoPaths.add(path.resolve(s.photo_path))
+                } catch (_) {}
             }
         }
 
@@ -180,14 +226,24 @@ function cleanupExpiredSessionsAndFiles() {
             addLog('info', `🧹 Limpieza: ${expiredCount} sesión(es) expirada(s) eliminada(s) por inactividad.`)
         }
 
-        // Inspeccionar archivos en uploads/
+        // 2. Reportes confirmados pendientes de sincronización (NUNCA deben eliminarse sus fotos)
+        try {
+            const pendingReports = db.prepare('SELECT photo_path FROM pending_sync_reports WHERE photo_path IS NOT NULL').all()
+            for (const p of pendingReports) {
+                if (p.photo_path) {
+                    activePhotoPaths.add(path.resolve(p.photo_path))
+                }
+            }
+        } catch (_) {}
+
+        // 3. Inspeccionar archivos en uploads/
         if (fs.existsSync(UPLOADS_DIR)) {
             const files = fs.readdirSync(UPLOADS_DIR)
             const now = Date.now()
 
             for (const file of files) {
                 const fullPath = path.resolve(UPLOADS_DIR, file)
-                // CONDICIÓN ESTRICTA: Solo eliminar si NO pertenece a una sesión activa
+                // CONDICIÓN ESTRICTA: Solo eliminar si NO pertenece a una sesión activa NI a un reporte pendiente
                 if (!activePhotoPaths.has(fullPath)) {
                     try {
                         const stat = fs.statSync(fullPath)
@@ -201,6 +257,152 @@ function cleanupExpiredSessionsAndFiles() {
         }
     } catch (err) {
         addLog('error', `Error en mantenimiento de sesiones y archivos temporales: ${err.message}`)
+    }
+}
+
+// Cálculo de demora con backoff progresivo para reintentos de sincronización
+function getNextRetryDelayMs(attempts) {
+    // Backoff progresivo: intento 1: 5s, 2: 15s, 3: 45s, 4: 120s, 5+: 300s (máximo 5 min)
+    const delays = [5000, 15000, 45000, 120000, 300000]
+    const idx = Math.min(Math.max((attempts || 1) - 1, 0), delays.length - 1)
+    return delays[idx]
+}
+
+// Procesa la sincronización de un único reporte pendiente con Supabase
+async function processSinglePendingReport(report, customSyncDependencies = null) {
+    if (!report || !report.id) return { success: false, error: 'Reporte inválido' }
+
+    const uploadPhotoFn = customSyncDependencies?.uploadReportPhoto || uploadReportPhoto
+    const insertRecordFn = customSyncDependencies?.insertReportRecord || insertReportRecord
+    const isConfiguredFn = customSyncDependencies?.isSupabaseConfigured || isSupabaseConfigured
+
+    if (!isConfiguredFn()) {
+        addLog('warn', `Supabase no está configurado. El reporte pendiente ${report.id} continuará en espera.`)
+        return { success: false, error: 'Supabase no configurado' }
+    }
+
+    try {
+        let photoPublicUrl = report.storage_url || null
+
+        // Paso A: Subida de fotografía a Storage (si existe y aún no fue subida)
+        if (!photoPublicUrl && report.photo_path) {
+            if (fs.existsSync(report.photo_path)) {
+                const uploadRes = await uploadPhotoFn(report.photo_path)
+                if (uploadRes && uploadRes.success && uploadRes.publicUrl) {
+                    photoPublicUrl = uploadRes.publicUrl
+                    // Guardar de inmediato storage_url para evitar re-subidas duplicadas e inconsistencias
+                    db.prepare(`
+                        UPDATE pending_sync_reports
+                        SET storage_url = ?, updated_at = CURRENT_TIMESTAMP
+                        WHERE id = ?
+                    `).run(photoPublicUrl, report.id)
+                    addLog('info', `📸 Foto de reporte ${report.id} subida a Storage: ${photoPublicUrl}`)
+                } else {
+                    const uploadErr = uploadRes?.error || 'Fallo al subir a Storage'
+                    const nextAttempts = (report.attempts || 0) + 1
+                    const nextRetry = Date.now() + getNextRetryDelayMs(nextAttempts)
+                    db.prepare(`
+                        UPDATE pending_sync_reports
+                        SET attempts = ?,
+                            last_error = ?,
+                            next_retry_at = ?,
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE id = ?
+                    `).run(nextAttempts, `Storage: ${uploadErr}`, nextRetry, report.id)
+                    addLog('warn', `⚠️ Fallo al subir foto de reporte ${report.id} (Intento ${nextAttempts}): ${uploadErr}`)
+                    return { success: false, error: uploadErr }
+                }
+            } else {
+                addLog('warn', `⚠️ Foto local no encontrada en disco (${report.photo_path}). Continuando inserción sin foto.`)
+            }
+        }
+
+        // Paso B: Inserción en la base de datos de Supabase
+        const insertRes = await insertRecordFn({
+            latitude: report.latitude,
+            longitude: report.longitude,
+            description: report.description,
+            selected_affectations: report.selected_affectations,
+            photoUrl: photoPublicUrl,
+            estado: 'pendiente',
+            archivo_tipo: 'image/jpeg'
+        })
+
+        if (!insertRes || !insertRes.success) {
+            const dbErr = insertRes?.error || 'Fallo al insertar en base de datos'
+            const nextAttempts = (report.attempts || 0) + 1
+            const nextRetry = Date.now() + getNextRetryDelayMs(nextAttempts)
+            db.prepare(`
+                UPDATE pending_sync_reports
+                SET attempts = ?,
+                    last_error = ?,
+                    next_retry_at = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+            `).run(nextAttempts, `DB: ${dbErr}`, nextRetry, report.id)
+            addLog('warn', `⚠️ Fallo al registrar reporte ${report.id} en DB (Intento ${nextAttempts}): ${dbErr}`)
+            return { success: false, error: dbErr, storageUrlSaved: Boolean(photoPublicUrl) }
+        }
+
+        // Paso C: Éxito total (Storage + DB completados)
+        addLog('info', `☁️ Reporte ${report.id} sincronizado exitosamente con Supabase DB`)
+
+        // 1. Eliminar la fotografía local si existía
+        if (report.photo_path) {
+            safeDeleteUploadFile(report.photo_path)
+        }
+
+        // 2. Eliminar el registro pendiente de SQLite
+        db.prepare('DELETE FROM pending_sync_reports WHERE id = ?').run(report.id)
+
+        return {
+            success: true,
+            reportId: report.id,
+            publicUrl: photoPublicUrl,
+            remoteData: insertRes.data
+        }
+
+    } catch (err) {
+        const nextAttempts = (report.attempts || 0) + 1
+        const nextRetry = Date.now() + getNextRetryDelayMs(nextAttempts)
+        try {
+            db.prepare(`
+                UPDATE pending_sync_reports
+                SET attempts = ?,
+                    last_error = ?,
+                    next_retry_at = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+            `).run(nextAttempts, `Excepción: ${err.message}`, nextRetry, report.id)
+        } catch (_) {}
+        addLog('error', `⚠️ Excepción procesando sincronización de reporte ${report.id}: ${err.message}`)
+        return { success: false, error: err.message }
+    }
+}
+
+// Orquestador para sincronizar reportes pendientes listos para reintento
+let isSyncingPendingReports = false
+async function triggerSyncPendingReports(customDependencies = null) {
+    if (isSyncingPendingReports) return
+    isSyncingPendingReports = true
+
+    try {
+        const nowMs = Date.now()
+        const pendingReports = db.prepare(`
+            SELECT id, user_jid, latitude, longitude, selected_affectations, photo_path, description, storage_url, status, attempts, next_retry_at
+            FROM pending_sync_reports
+            WHERE status = 'PENDING' AND next_retry_at <= ?
+            ORDER BY created_at ASC
+            LIMIT 10
+        `).all(nowMs)
+
+        for (const report of pendingReports) {
+            await processSinglePendingReport(report, customDependencies)
+        }
+    } catch (err) {
+        addLog('error', `Error en triggerSyncPendingReports: ${err.message}`)
+    } finally {
+        isSyncingPendingReports = false
     }
 }
 
@@ -722,34 +924,51 @@ async function handleFloodReportFlow(sock, sender, msg) {
     if (session.state === 'AWAITING_CONFIRMATION') {
         if (text === '1' || lowerText === 'confirmar') {
             const confirmedSession = db.prepare('SELECT latitude, longitude, selected_affectations, photo_path, description FROM report_sessions WHERE user_jid = ?').get(sender) || session
-            db.prepare('DELETE FROM report_sessions WHERE user_jid = ?').run(sender)
 
+            // Validar coordenadas obligatorias
+            if (confirmedSession.latitude == null || confirmedSession.longitude == null) {
+                const invalidCoordsMsg = `No se detectaron coordenadas válidas para este reporte. Escribí *REPORTAR* para iniciar un reporte nuevo.`
+                deleteSession(sender)
+                await sock.sendMessage(sender, { text: invalidCoordsMsg })
+                return true
+            }
+
+            const reportId = crypto.randomUUID ? crypto.randomUUID() : crypto.randomBytes(16).toString('hex')
+
+            // 1. Guardar primero en pending_sync_reports
+            try {
+                db.prepare(`
+                    INSERT INTO pending_sync_reports (
+                        id, user_jid, latitude, longitude, selected_affectations, photo_path, description, status, attempts, next_retry_at, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, 'PENDING', 0, 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                `).run(
+                    reportId,
+                    sender,
+                    confirmedSession.latitude,
+                    confirmedSession.longitude,
+                    confirmedSession.selected_affectations || '[]',
+                    confirmedSession.photo_path || null,
+                    confirmedSession.description || null
+                )
+            } catch (err) {
+                addLog('error', `Fallo al registrar reporte en pending_sync_reports para ${sender}: ${err.message}`)
+                const dbFailMsg = `⚠️ Ocurrió un error al registrar tu reporte localmente. Por favor respondé *1* para intentar confirmar nuevamente.`
+                await sock.sendMessage(sender, { text: dbFailMsg })
+                return true
+            }
+
+            // 2. Solo tras guardar exitosamente en SQLite, cerrar la sesión conversacional SIN borrar la foto
+            deleteSessionWithoutPhoto(sender)
+
+            // 3. Enviar confirmación al usuario
             const finalMsg = `✅ *¡Reporte recibido correctamente!*\n\n¡Muchas gracias por tu colaboración! 🙌\n\nTu reporte contribuirá al monitoreo de inundaciones urbanas y a la identificación de zonas afectadas.\n\n🗺️ *¡Explorá nuestro mapa interactivo!*\n\nPodés visualizar los reportes de inundaciones en nuestra plataforma web:\n\n🔗 https://mapa-chi-steel.vercel.app/`
             await sock.sendMessage(sender, { text: finalMsg })
-            addLog('message_out', `Reporte confirmado por ${sender}. Sesión cerrada.`)
+            addLog('message_out', `Reporte confirmado por ${sender} (ID pendiente: ${reportId}). Sesión cerrada.`)
 
-            // Sincronización asíncrona hacia Supabase (no bloquea al usuario)
-            if (isSupabaseConfigured()) {
-                syncReportToSupabase(confirmedSession)
-                    .then(syncRes => {
-                        // Solo eliminar la foto local si AMBOS fueron exitosos: subida a Storage (publicUrl) Y registro en DB (success)
-                        if (syncRes.success && syncRes.publicUrl) {
-                            addLog('info', `☁️ Reporte y fotografía sincronizados en Supabase (ID: ${syncRes.report?.id || 'OK'})`)
-                            if (confirmedSession.photo_path) {
-                                safeDeleteUploadFile(confirmedSession.photo_path)
-                            }
-                        } else if (syncRes.success && !syncRes.publicUrl) {
-                            addLog('warn', `⚠️ Reporte guardado en DB pero la foto no se pudo subir a Storage. Se conserva foto local: ${confirmedSession.photo_path}`)
-                        } else {
-                            addLog('error', `⚠️ Fallo de sincronización con Supabase: ${syncRes.error}`)
-                        }
-                    })
-                    .catch(syncErr => {
-                        addLog('error', `⚠️ Excepción al sincronizar con Supabase: ${syncErr.message}`)
-                    })
-            } else {
-                addLog('info', 'Supabase no está configurado en .env. El reporte se procesó localmente.')
-            }
+            // 4. Disparar sincronización asíncrona hacia Supabase (no bloquea al usuario)
+            triggerSyncPendingReports().catch(syncErr => {
+                addLog('error', `⚠️ Error al activar sincronización asíncrona: ${syncErr.message}`)
+            })
 
             return true
         }
@@ -777,9 +996,19 @@ async function connectToWhatsApp() {
     // Mantenimiento de arranque: purga silenciosa de sesiones expiradas y archivos huérfanos
     cleanupExpiredSessionsAndFiles()
 
+    // Sincronizar reportes pendientes que hayan quedado de sesiones anteriores
+    triggerSyncPendingReports().catch(e => addLog('error', `Error al sincronizar reportes pendientes en arranque: ${e.message}`))
+
     // Programar limpieza periódica cada 15 minutos en segundo plano (sin mensajes a usuarios)
     if (!global.cleanupInterval) {
         global.cleanupInterval = setInterval(cleanupExpiredSessionsAndFiles, 15 * 60 * 1000)
+    }
+
+    // Programar reintento periódico de reportes pendientes cada 30 segundos
+    if (!global.syncInterval) {
+        global.syncInterval = setInterval(() => {
+            triggerSyncPendingReports().catch(e => addLog('error', `Error en intervalo de sincronización: ${e.message}`))
+        }, 30 * 1000)
     }
 
     const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR)
@@ -896,19 +1125,31 @@ async function connectToWhatsApp() {
     return sock
 }
 
+function closeDatabase() {
+    try {
+        db.close()
+    } catch (_) {}
+}
+
 // Exportación para suite de pruebas
 if (process.env.NODE_ENV === 'test') {
     module.exports = {
         db,
+        closeDatabase,
         SESSION_TIMEOUT_MS,
         parseSessionUtcTimestamp,
         isSessionExpired,
         safeDeleteUploadFile,
         deleteSession,
+        deleteSessionWithoutPhoto,
         cleanupExpiredSessionsAndFiles,
+        getNextRetryDelayMs,
+        processSinglePendingReport,
+        triggerSyncPendingReports,
         handleFloodReportFlow,
         AFFECTATION_CATEGORIES,
-        UPLOADS_DIR
+        UPLOADS_DIR,
+        DB_PATH
     }
 }
 
