@@ -476,72 +476,60 @@ function askQuestion(query) {
 }
 
 // ==============================================================================
-// CONFIGURACIÓN EXPERIMENTAL DE BOTONES INTERACTIVOS (BAILEYS)
+// CONFIGURACIÓN DE INTERFAZ SELECCIONABLE (CONTINUAR / CANCELAR)
 // ==============================================================================
-// Control de reversibilidad rápida (Condición 10):
-// - true: envía interfaz interactiva con botones seleccionables ('Continuar' y 'Cancelar').
-// - false: revierte inmediatamente al mensaje de texto plano tradicional.
-const EXPERIMENTAL_BUTTONS_ENABLED = false
+// Modalidades admitidas (Condición 10):
+// - 'POLL': Encuesta interactiva nativa de WhatsApp con 2 opciones ('1. Continuar' y '0. Cancelar').
+//           100% admitida por Meta en todos los dispositivos y cuentas personales.
+// - 'TEXT': Mensaje tradicional de texto plano ("Respondé 1 o LISTO...").
+const DECISION_INTERFACE_MODE = 'POLL'
 
-// Envío de opciones interactivas o texto clásico (Continuar / Cancelar)
-async function sendContinueOrCancelButtons(sock, sender, forceButtons = false) {
-    if (!EXPERIMENTAL_BUTTONS_ENABLED && !forceButtons) {
-        const classicText = `👉 Respondé *1* o *LISTO* para continuar.\n👉 Respondé *0* o *CANCELAR* para salir.`
-        await sock.sendMessage(sender, { text: classicText })
-        addLog('message_out', `Instrucciones clásicas de texto enviadas a ${sender}`)
-        return
-    }
+// Registro en memoria de encuestas activas para asociar ID con su clave de descifrado y tipo
+if (!global.pollRegistry) global.pollRegistry = new Map()
 
-    try {
-        if (typeof sock.relayMessage === 'function') {
-            const buttonMessage = generateWAMessageFromContent(sender, {
-                viewOnceMessage: {
-                    message: {
-                        interactiveMessage: proto.Message.InteractiveMessage.create({
-                            body: proto.Message.InteractiveMessage.Body.create({
-                                text: `👉 Seleccioná una opción para continuar:\n\n_(También podés responder escribiendo *1* o *LISTO* para continuar, *0* o *CANCELAR* para salir)_`
-                            }),
-                            footer: proto.Message.InteractiveMessage.Footer.create({
-                                text: `Sistema de Monitoreo de Inundaciones`
-                            }),
-                            nativeFlowMessage: proto.Message.InteractiveMessage.NativeFlowMessage.create({
-                                buttons: [
-                                    {
-                                        name: 'quick_reply',
-                                        buttonParamsJson: JSON.stringify({
-                                            display_text: 'Continuar',
-                                            id: '1'
-                                        })
-                                    },
-                                    {
-                                        name: 'quick_reply',
-                                        buttonParamsJson: JSON.stringify({
-                                            display_text: 'Cancelar',
-                                            id: '0'
-                                        })
-                                    }
-                                ]
-                            })
-                        })
-                    }
+// Envío de interfaz interactiva o texto tradicional según configuración
+async function sendContinueOrCancelInterface(sock, sender, modeOverride = null) {
+    const mode = modeOverride || DECISION_INTERFACE_MODE
+
+    if (mode === 'POLL') {
+        try {
+            const decisionMsg = await sock.sendMessage(sender, {
+                poll: {
+                    name: '👉 ¿Deseás continuar con el reporte?',
+                    values: ['1. Continuar', '0. Cancelar'],
+                    selectableCount: 1
                 }
-            }, {})
+            })
 
-            await sock.relayMessage(sender, buttonMessage.message, { messageId: buttonMessage.key.id })
-            addLog('message_out', `Botones interactivos (Continuar / Cancelar) enviados a ${sender}`)
-            return
+            if (decisionMsg?.key?.id) {
+                const messageSecret = decisionMsg.message?.messageContextInfo?.messageSecret
+                if (messageSecret) {
+                    const encKeyHex = Buffer.isBuffer(messageSecret)
+                        ? messageSecret.toString('hex')
+                        : Buffer.from(messageSecret, 'base64').toString('hex')
+
+                    global.pollRegistry.set(decisionMsg.key.id, {
+                        type: 'DECISION',
+                        encKeyHex,
+                        userJid: sender
+                    })
+                }
+            }
+            addLog('message_out', `Encuesta interactiva de decisión (Continuar / Cancelar) enviada a ${sender}`)
+            return decisionMsg
+        } catch (err) {
+            addLog('warn', `Fallo al enviar encuesta de decisión (${err.message}). Utilizando texto alternativo.`)
         }
-    } catch (err) {
-        addLog('warn', `No se pudieron enviar los botones interactivos (${err.message}). Utilizando texto alternativo.`)
     }
 
-    // Fallback de seguridad si relayMessage no está disponible o la plataforma falla
-    const fallbackText = `👉 Respondé *1* o *LISTO* para continuar.\n👉 Respondé *0* o *CANCELAR* para salir.`
-    await sock.sendMessage(sender, { text: fallbackText })
-    addLog('message_out', `Instrucciones de texto (fallback) enviadas a ${sender}`)
+    // Modo TEXT o Fallback seguro
+    const classicText = `👉 Respondé *1* o *LISTO* para continuar.\n👉 Respondé *0* o *CANCELAR* para salir.`
+    const sent = await sock.sendMessage(sender, { text: classicText })
+    addLog('message_out', `Instrucciones de texto clásico enviadas a ${sender}`)
+    return sent
 }
 
-// Envío de encuesta interactiva de WhatsApp para afectaciones
+// Envío de encuesta interactiva de WhatsApp para afectaciones y opciones de decisión
 async function sendAffectationPoll(sock, sender) {
     let pollMsgId = null
     let pollEncKeyHex = null
@@ -568,16 +556,22 @@ async function sendAffectationPoll(sock, sender) {
         addLog('error', `Error al enviar encuesta de afectaciones: ${e.message}`)
     }
 
-    if (pollMsgId || pollEncKeyHex) {
+    if (pollMsgId && pollEncKeyHex) {
         db.prepare(`
             UPDATE report_sessions
             SET poll_msg_id = ?,
                 poll_enc_key = ?
             WHERE user_jid = ?
         `).run(pollMsgId, pollEncKeyHex, sender)
+
+        global.pollRegistry.set(pollMsgId, {
+            type: 'AFFECTATIONS',
+            encKeyHex: pollEncKeyHex,
+            userJid: sender
+        })
     }
 
-    await sendContinueOrCancelButtons(sock, sender)
+    await sendContinueOrCancelInterface(sock, sender)
 }
 
 // Control del flujo conversacional para el reporte de inundaciones
@@ -739,92 +733,138 @@ async function handleFloodReportFlow(sock, sender, msg) {
                 const pollCreationKey = pollUpdate.pollCreationMessageKey
                 const pollMsgId = pollCreationKey?.id || session.poll_msg_id
 
-                if (vote && session.poll_enc_key && pollMsgId) {
-                    const pollEncKey = Buffer.from(session.poll_enc_key, 'hex')
+                if (vote && pollMsgId) {
+                    let pollEncKeyHex = session.poll_enc_key
+                    let pollType = 'AFFECTATIONS'
 
-                    // Generar candidatos exhaustivos para votante y bot (soportando LID y números normales)
-                    const voterCandidates = new Set()
-                    voterCandidates.add(sender)
-                    voterCandidates.add(jidNormalizedUser(sender))
-                    const [voterClean, voterServer] = (sender || '').split('@')
-                    const voterRaw = (voterClean || '').split(':')[0]
-                    if (voterServer && voterRaw) {
-                        voterCandidates.add(`${voterRaw}@${voterServer}`)
-                        voterCandidates.add(`${voterRaw}:0@${voterServer}`)
+                    if (global.pollRegistry && global.pollRegistry.has(pollMsgId)) {
+                        const entry = global.pollRegistry.get(pollMsgId)
+                        if (entry?.encKeyHex) pollEncKeyHex = entry.encKeyHex
+                        if (entry?.type) pollType = entry.type
                     }
-                    try {
-                        const revPath = path.join(AUTH_DIR, `lid-mapping-${voterRaw}_reverse.json`)
-                        if (fs.existsSync(revPath)) {
-                            const pn = JSON.parse(fs.readFileSync(revPath, 'utf8'))
-                            if (pn) {
-                                voterCandidates.add(`${pn}@s.whatsapp.net`)
-                                voterCandidates.add(`${pn}:0@s.whatsapp.net`)
-                            }
+
+                    if (pollEncKeyHex) {
+                        const pollEncKey = Buffer.from(pollEncKeyHex, 'hex')
+
+                        // Generar candidatos exhaustivos para votante y bot (soportando LID y números normales)
+                        const voterCandidates = new Set()
+                        voterCandidates.add(sender)
+                        voterCandidates.add(jidNormalizedUser(sender))
+                        const [voterClean, voterServer] = (sender || '').split('@')
+                        const voterRaw = (voterClean || '').split(':')[0]
+                        if (voterServer && voterRaw) {
+                            voterCandidates.add(`${voterRaw}@${voterServer}`)
+                            voterCandidates.add(`${voterRaw}:0@${voterServer}`)
                         }
-                    } catch (_) {}
-
-                    const voterAuthor = getKeyAuthor(msg.key, sock.user?.id)
-                    if (voterAuthor) {
-                        voterCandidates.add(voterAuthor)
-                        voterCandidates.add(jidNormalizedUser(voterAuthor))
-                    }
-                    if (msg.key?.participant) {
-                        voterCandidates.add(msg.key.participant)
-                        voterCandidates.add(jidNormalizedUser(msg.key.participant))
-                    }
-
-                    const botCandidates = new Set()
-                    if (sock.user?.id) {
-                        botCandidates.add(sock.user.id)
-                        botCandidates.add(jidNormalizedUser(sock.user.id))
-                        const botRaw = sock.user.id.split('@')[0].split(':')[0]
-                        botCandidates.add(`${botRaw}@s.whatsapp.net`)
-                        botCandidates.add(`${botRaw}:0@s.whatsapp.net`)
-                    }
-                    if (sock.user?.lid) {
-                        botCandidates.add(sock.user.lid)
-                        botCandidates.add(jidNormalizedUser(sock.user.lid))
-                        const botLidRaw = sock.user.lid.split('@')[0].split(':')[0]
-                        botCandidates.add(`${botLidRaw}@lid`)
-                        botCandidates.add(`${botLidRaw}:0@lid`)
-                    }
-                    const creatorFromKey = pollCreationKey?.participant || pollCreationKey?.remoteJid || ''
-                    if (creatorFromKey) {
-                        botCandidates.add(creatorFromKey)
-                        botCandidates.add(jidNormalizedUser(creatorFromKey))
-                    }
-
-                    let decrypted = null
-                    let lastDecryptError = null
-                    for (const voterJid of voterCandidates) {
-                        for (const pollCreatorJid of botCandidates) {
-                            try {
-                                decrypted = decryptPollVote(vote, { pollCreatorJid, pollMsgId, pollEncKey, voterJid })
-                                if (decrypted?.selectedOptions) break
-                            } catch (e) {
-                                lastDecryptError = e
+                        try {
+                            const revPath = path.join(AUTH_DIR, `lid-mapping-${voterRaw}_reverse.json`)
+                            if (fs.existsSync(revPath)) {
+                                const pn = JSON.parse(fs.readFileSync(revPath, 'utf8'))
+                                if (pn) {
+                                    voterCandidates.add(`${pn}@s.whatsapp.net`)
+                                    voterCandidates.add(`${pn}:0@s.whatsapp.net`)
+                                }
                             }
+                        } catch (_) {}
+
+                        const voterAuthor = getKeyAuthor(msg.key, sock.user?.id)
+                        if (voterAuthor) {
+                            voterCandidates.add(voterAuthor)
+                            voterCandidates.add(jidNormalizedUser(voterAuthor))
                         }
-                        if (decrypted?.selectedOptions) break
-                    }
+                        if (msg.key?.participant) {
+                            voterCandidates.add(msg.key.participant)
+                            voterCandidates.add(jidNormalizedUser(msg.key.participant))
+                        }
 
-                    if (decrypted && decrypted.selectedOptions) {
-                        const selectedHashes = decrypted.selectedOptions.map(opt => Buffer.from(opt).toString('hex'))
-                        const selectedCategories = []
-                        AFFECTATION_CATEGORIES.forEach((cat, idx) => {
-                            const optionText = `${idx + 1}. ${cat}`
-                            const hash = crypto.createHash('sha256').update(optionText).digest('hex')
-                            if (selectedHashes.includes(hash)) {
-                                selectedCategories.push(cat)
+                        const botCandidates = new Set()
+                        if (sock.user?.id) {
+                            botCandidates.add(sock.user.id)
+                            botCandidates.add(jidNormalizedUser(sock.user.id))
+                            const botRaw = sock.user.id.split('@')[0].split(':')[0]
+                            botCandidates.add(`${botRaw}@s.whatsapp.net`)
+                            botCandidates.add(`${botRaw}:0@s.whatsapp.net`)
+                        }
+                        if (sock.user?.lid) {
+                            botCandidates.add(sock.user.lid)
+                            botCandidates.add(jidNormalizedUser(sock.user.lid))
+                            const botLidRaw = sock.user.lid.split('@')[0].split(':')[0]
+                            botCandidates.add(`${botLidRaw}@lid`)
+                            botCandidates.add(`${botLidRaw}:0@lid`)
+                        }
+                        const creatorFromKey = pollCreationKey?.participant || pollCreationKey?.remoteJid || ''
+                        if (creatorFromKey) {
+                            botCandidates.add(creatorFromKey)
+                            botCandidates.add(jidNormalizedUser(creatorFromKey))
+                        }
+
+                        let decrypted = null
+                        let lastDecryptError = null
+                        for (const voterJid of voterCandidates) {
+                            for (const pollCreatorJid of botCandidates) {
+                                try {
+                                    decrypted = decryptPollVote(vote, { pollCreatorJid, pollMsgId, pollEncKey, voterJid })
+                                    if (decrypted?.selectedOptions) break
+                                } catch (e) {
+                                    lastDecryptError = e
+                                }
                             }
-                        })
+                            if (decrypted?.selectedOptions) break
+                        }
 
-                        db.prepare('UPDATE report_sessions SET selected_affectations = ?, updated_at = CURRENT_TIMESTAMP WHERE user_jid = ?')
-                            .run(JSON.stringify(selectedCategories), sender)
+                        if (decrypted && decrypted.selectedOptions) {
+                            const selectedHashes = decrypted.selectedOptions.map(opt => Buffer.from(opt).toString('hex'))
 
-                        addLog('info', `Afectaciones actualizadas desde encuesta para ${sender}: ${selectedCategories.join(', ')}`)
-                    } else {
-                        addLog('warn', `No se pudo descifrar voto de encuesta para ${sender}: ${lastDecryptError?.message || 'Sin opciones'}`)
+                            // 1. Si el voto corresponde a la encuesta interactiva de decisión (Continuar / Cancelar)
+                            if (pollType === 'DECISION') {
+                                const hashContinue1 = crypto.createHash('sha256').update('1. Continuar').digest('hex')
+                                const hashContinue2 = crypto.createHash('sha256').update('Continuar').digest('hex')
+                                const hashCancel1 = crypto.createHash('sha256').update('0. Cancelar').digest('hex')
+                                const hashCancel2 = crypto.createHash('sha256').update('Cancelar').digest('hex')
+
+                                if (selectedHashes.includes(hashContinue1) || selectedHashes.includes(hashContinue2)) {
+                                    addLog('info', `✅ Opción 'Continuar' seleccionada en encuesta interactiva por ${sender}`)
+                                    db.prepare(`
+                                        UPDATE report_sessions
+                                        SET state = 'AWAITING_DESCRIPTION',
+                                            updated_at = CURRENT_TIMESTAMP
+                                        WHERE user_jid = ?
+                                    `).run(sender)
+
+                                    const descPrompt = `✍️ *Descripción del incidente (opcional)*\n\n¿Querés agregar algún detalle sobre lo ocurrido?\n\n👉 Escribí tu descripción o respondé *1* para omitir.`
+                                    await sock.sendMessage(sender, { text: descPrompt })
+                                    addLog('message_out', `Solicitud de descripción enviada a ${sender}`)
+                                    return true
+                                }
+
+                                if (selectedHashes.includes(hashCancel1) || selectedHashes.includes(hashCancel2)) {
+                                    addLog('info', `❌ Opción 'Cancelar' seleccionada en encuesta interactiva por ${sender}`)
+                                    deleteSession(sender)
+                                    const cancelMsg = 'Reporte cancelado. Escribí *REPORTAR* cuando quieras comenzar de nuevo.'
+                                    await sock.sendMessage(sender, { text: cancelMsg })
+                                    return true
+                                }
+                            }
+
+                            // 2. Si el voto corresponde a la encuesta de afectaciones
+                            const selectedCategories = []
+                            AFFECTATION_CATEGORIES.forEach((cat, idx) => {
+                                const optionText = `${idx + 1}. ${cat}`
+                                const hash = crypto.createHash('sha256').update(optionText).digest('hex')
+                                if (selectedHashes.includes(hash)) {
+                                    selectedCategories.push(cat)
+                                }
+                            })
+
+                            if (selectedCategories.length > 0 || pollType === 'AFFECTATIONS') {
+                                db.prepare('UPDATE report_sessions SET selected_affectations = ?, updated_at = CURRENT_TIMESTAMP WHERE user_jid = ?')
+                                    .run(JSON.stringify(selectedCategories), sender)
+
+                                addLog('info', `Afectaciones actualizadas desde encuesta para ${sender}: ${selectedCategories.join(', ')}`)
+                            }
+                        } else {
+                            addLog('warn', `No se pudo descifrar voto de encuesta para ${sender}: ${lastDecryptError?.message || 'Sin opciones'}`)
+                        }
                     }
                 }
             } catch (err) {
@@ -1260,8 +1300,10 @@ if (process.env.NODE_ENV === 'test') {
         AFFECTATION_CATEGORIES,
         UPLOADS_DIR,
         DB_PATH,
-        EXPERIMENTAL_BUTTONS_ENABLED,
-        sendContinueOrCancelButtons
+        DECISION_INTERFACE_MODE,
+        sendContinueOrCancelInterface,
+        EXPERIMENTAL_BUTTONS_ENABLED: false,
+        sendContinueOrCancelButtons: sendContinueOrCancelInterface
     }
 }
 

@@ -11,6 +11,8 @@ process.env.NODE_ENV = 'test'
 const fs = require('fs')
 const path = require('path')
 const assert = require('assert')
+const crypto = require('crypto')
+const { proto, aesEncryptGCM, hmacSign } = require('@whiskeysockets/baileys')
 
 // Directorio temporal aislado para pruebas
 const testDir = path.resolve(__dirname, 'test_tmp')
@@ -45,6 +47,8 @@ const {
     handleFloodReportFlow,
     UPLOADS_DIR,
     DB_PATH,
+    DECISION_INTERFACE_MODE,
+    sendContinueOrCancelInterface,
     EXPERIMENTAL_BUTTONS_ENABLED,
     sendContinueOrCancelButtons
 } = require('./bot')
@@ -57,20 +61,53 @@ console.log(`🗄️ Base de datos temporal: ${testDbPath}`)
 console.log(`📸 Carpeta temporal de uploads: ${testUploads}\n`)
 
 // Mock de socket de Baileys para capturar mensajes salientes
+let mockMsgSeq = 0
 function createMockSocket() {
     const sentMessages = []
     return {
         sentMessages,
         sendMessage: async (jid, content) => {
+            mockMsgSeq++
+            const id = 'MOCK_MSG_' + Date.now() + '_' + mockMsgSeq
             sentMessages.push({ jid, content })
-            return { key: { id: 'MOCK_MSG_' + Date.now() } }
+            return {
+                key: { id, remoteJid: jid, fromMe: true },
+                message: {
+                    messageContextInfo: {
+                        messageSecret: Buffer.alloc(32, 7)
+                    }
+                }
+            }
         },
         relayMessage: async (jid, message, options) => {
             sentMessages.push({ jid, content: { relayMessage: message, options } })
-            return { key: { id: options?.messageId || 'MOCK_RELAY_' + Date.now() } }
+            return { key: { id: options?.messageId || ('MOCK_RELAY_' + Date.now()) } }
         },
         user: { id: '595981111111:0@s.whatsapp.net', lid: '123456789@lid' }
     }
+}
+
+// Helper para generar votos cifrados reales idénticos a los enviados por el cliente de WhatsApp
+function generateEncryptedPollVote({ pollMsgId, pollCreatorJid, voterJid, pollEncKey, selectedOptionText }) {
+    const optionHash = crypto.createHash('sha256').update(selectedOptionText).digest()
+    const voteProto = proto.Message.PollVoteMessage.encode({
+        selectedOptions: [optionHash]
+    }).finish()
+
+    const sign = Buffer.concat([
+        Buffer.from(pollMsgId),
+        Buffer.from(pollCreatorJid),
+        Buffer.from(voterJid),
+        Buffer.from('Poll Vote'),
+        new Uint8Array([1])
+    ])
+    const key0 = hmacSign(pollEncKey, new Uint8Array(32), 'sha256')
+    const decKey = hmacSign(sign, key0, 'sha256')
+    const aad = Buffer.from(`${pollMsgId}\u0000${voterJid}`)
+    const encIv = crypto.randomBytes(12)
+    const encPayload = aesEncryptGCM(voteProto, decKey, encIv, aad)
+
+    return { encPayload, encIv }
 }
 
 let passedTests = 0
@@ -492,78 +529,105 @@ async function runTests() {
         passedTests++
 
         // --------------------------------------------------------------------------
-        // Test 13: Interfaz experimental de botones interactivos y compatibilidad dual
+        // Test 13: Interfaz interactiva nativa (Continuar / Cancelar) y fallback a texto
         // --------------------------------------------------------------------------
-        console.log('▶️ Test 13: Botones interactivos (Continuar / Cancelar) y comandos de texto alternativos...')
+        console.log('▶️ Test 13: Encuesta interactiva nativa (Continuar / Cancelar) y comandos de texto...')
 
-        // 13a: Envío de botones interactivos a través de sendContinueOrCancelButtons (modo forzado para pruebas)
-        const testUserButtons = '595987778888@s.whatsapp.net'
-        const mockSockBtn = createMockSocket()
-        await sendContinueOrCancelButtons(mockSockBtn, testUserButtons, true)
+        // 13a: Envío de encuesta interactiva nativa (modo 'POLL' activo por defecto)
+        const testUserPoll = '595987778888@s.whatsapp.net'
+        const mockSockPoll = createMockSocket()
+        const sentPollMsg = await sendContinueOrCancelInterface(mockSockPoll, testUserPoll)
 
-        assert.ok(mockSockBtn.sentMessages.length > 0, 'Debe haber enviado un mensaje')
-        const sentContent = mockSockBtn.sentMessages[0].content
-        const relayMsg = sentContent.relayMessage
-        assert.ok(relayMsg?.viewOnceMessage?.message?.interactiveMessage, 'Debe enviar un interactiveMessage')
-        const buttons = relayMsg.viewOnceMessage.message.interactiveMessage.nativeFlowMessage.buttons
-        assert.strictEqual(buttons.length, 2, 'Debe contener exactamente 2 botones')
-        assert.ok(buttons[0].buttonParamsJson.includes('Continuar'), 'Primer botón debe ser Continuar')
-        assert.ok(buttons[1].buttonParamsJson.includes('Cancelar'), 'Segundo botón debe ser Cancelar')
+        assert.ok(mockSockPoll.sentMessages.length > 0, 'Debe haber enviado un mensaje')
+        const sentPollContent = mockSockPoll.sentMessages[0].content
+        assert.ok(sentPollContent.poll, 'Debe enviar una encuesta nativa de WhatsApp')
+        assert.strictEqual(sentPollContent.poll.name, '👉 ¿Deseás continuar con el reporte?')
+        assert.deepStrictEqual(sentPollContent.poll.values, ['1. Continuar', '0. Cancelar'])
+        assert.strictEqual(sentPollContent.poll.selectableCount, 1, 'Debe permitir seleccionar solo una opción')
+        assert.ok(global.pollRegistry.has(sentPollMsg.key.id), 'Debe registrar la encuesta en global.pollRegistry')
+        const regEntry = global.pollRegistry.get(sentPollMsg.key.id)
+        assert.strictEqual(regEntry.type, 'DECISION')
 
-        // 13a-bis: Verificación del modo seguro/clásico por defecto
+        // 13b: Modo tradicional de texto plano (reversibilidad rápida mediante modeOverride = 'TEXT')
         const mockSockClassic = createMockSocket()
-        await sendContinueOrCancelButtons(mockSockClassic, testUserButtons, false)
-        assert.ok(mockSockClassic.sentMessages[0].content.text.includes('Respondé *1* o *LISTO*'), 'Por defecto debe emitir texto clásico seguro')
+        await sendContinueOrCancelInterface(mockSockClassic, testUserPoll, 'TEXT')
+        assert.ok(mockSockClassic.sentMessages[0].content.text.includes('Respondé *1* o *LISTO*'), 'Modo TEXT debe emitir texto clásico tradicional')
 
-        // 13b: Respuesta al presionar botón 'Continuar' (id: '1')
-        const userBtnContinue = '595989991111@s.whatsapp.net'
-        deleteSession(userBtnContinue)
+        // 13c: Respuesta seleccionando "1. Continuar" en la encuesta interactiva
+        const userPollContinue = '595989991111@s.whatsapp.net'
+        deleteSession(userPollContinue)
         db.prepare(`
             INSERT INTO report_sessions (user_jid, state, updated_at)
             VALUES (?, 'AWAITING_AFFECTATIONS_AND_DESC', datetime('now'))
-        `).run(userBtnContinue)
+        `).run(userPollContinue)
 
-        const mockSockBtnContinue = createMockSocket()
-        await handleFloodReportFlow(mockSockBtnContinue, userBtnContinue, {
-            key: { remoteJid: userBtnContinue, id: 'MSG_BTN_1' },
+        const mockSockVoteContinue = createMockSocket()
+        const decMsgContinue = await sendContinueOrCancelInterface(mockSockVoteContinue, userPollContinue, 'POLL')
+        const voteEncContinue = generateEncryptedPollVote({
+            pollMsgId: decMsgContinue.key.id,
+            pollCreatorJid: mockSockVoteContinue.user.id,
+            voterJid: userPollContinue,
+            pollEncKey: Buffer.from(global.pollRegistry.get(decMsgContinue.key.id).encKeyHex, 'hex'),
+            selectedOptionText: '1. Continuar'
+        })
+
+        await handleFloodReportFlow(mockSockVoteContinue, userPollContinue, {
+            key: { remoteJid: userPollContinue, id: 'MSG_VOTE_CONT_1' },
             message: {
-                interactiveResponseMessage: {
-                    nativeFlowResponseMessage: {
-                        paramsJson: JSON.stringify({ id: '1', display_text: 'Continuar' })
-                    }
+                pollUpdateMessage: {
+                    pollCreationMessageKey: {
+                        id: decMsgContinue.key.id,
+                        remoteJid: userPollContinue,
+                        fromMe: true
+                    },
+                    vote: voteEncContinue
                 }
             }
         })
 
-        const sessionAfterContinue = db.prepare('SELECT state FROM report_sessions WHERE user_jid = ?').get(userBtnContinue)
-        assert.strictEqual(sessionAfterContinue?.state, 'AWAITING_DESCRIPTION', 'Presionar Continuar debe avanzar a AWAITING_DESCRIPTION')
-        assert.ok(mockSockBtnContinue.sentMessages[0].content.text.includes('Descripción'), 'Debe solicitar descripción')
+        const sessionAfterVoteContinue = db.prepare('SELECT state FROM report_sessions WHERE user_jid = ?').get(userPollContinue)
+        assert.strictEqual(sessionAfterVoteContinue?.state, 'AWAITING_DESCRIPTION', 'Votar Continuar en encuesta debe avanzar a AWAITING_DESCRIPTION')
+        const lastMsgContinue = mockSockVoteContinue.sentMessages[mockSockVoteContinue.sentMessages.length - 1]
+        assert.ok(lastMsgContinue.content.text.includes('Descripción'), 'Debe solicitar descripción del incidente')
 
-        // 13c: Respuesta al presionar botón 'Cancelar' (id: '0')
-        const userBtnCancel = '595989992222@s.whatsapp.net'
-        deleteSession(userBtnCancel)
+        // 13d: Respuesta seleccionando "0. Cancelar" en la encuesta interactiva
+        const userPollCancel = '595989992222@s.whatsapp.net'
+        deleteSession(userPollCancel)
         db.prepare(`
             INSERT INTO report_sessions (user_jid, state, updated_at)
             VALUES (?, 'AWAITING_AFFECTATIONS_AND_DESC', datetime('now'))
-        `).run(userBtnCancel)
+        `).run(userPollCancel)
 
-        const mockSockBtnCancel = createMockSocket()
-        await handleFloodReportFlow(mockSockBtnCancel, userBtnCancel, {
-            key: { remoteJid: userBtnCancel, id: 'MSG_BTN_0' },
+        const mockSockVoteCancel = createMockSocket()
+        const decMsgCancel = await sendContinueOrCancelInterface(mockSockVoteCancel, userPollCancel, 'POLL')
+        const voteEncCancel = generateEncryptedPollVote({
+            pollMsgId: decMsgCancel.key.id,
+            pollCreatorJid: mockSockVoteCancel.user.id,
+            voterJid: userPollCancel,
+            pollEncKey: Buffer.from(global.pollRegistry.get(decMsgCancel.key.id).encKeyHex, 'hex'),
+            selectedOptionText: '0. Cancelar'
+        })
+
+        await handleFloodReportFlow(mockSockVoteCancel, userPollCancel, {
+            key: { remoteJid: userPollCancel, id: 'MSG_VOTE_CANC_1' },
             message: {
-                interactiveResponseMessage: {
-                    nativeFlowResponseMessage: {
-                        paramsJson: JSON.stringify({ id: '0', display_text: 'Cancelar' })
-                    }
+                pollUpdateMessage: {
+                    pollCreationMessageKey: {
+                        id: decMsgCancel.key.id,
+                        remoteJid: userPollCancel,
+                        fromMe: true
+                    },
+                    vote: voteEncCancel
                 }
             }
         })
 
-        const sessionAfterCancel = db.prepare('SELECT state FROM report_sessions WHERE user_jid = ?').get(userBtnCancel)
-        assert.strictEqual(sessionAfterCancel, undefined, 'Presionar Cancelar debe eliminar la sesión')
-        assert.ok(mockSockBtnCancel.sentMessages[0].content.text.includes('Reporte cancelado'), 'Debe enviar mensaje de cancelación')
+        const sessionAfterVoteCancel = db.prepare('SELECT state FROM report_sessions WHERE user_jid = ?').get(userPollCancel)
+        assert.strictEqual(sessionAfterVoteCancel, undefined, 'Votar Cancelar en encuesta debe eliminar la sesión')
+        const lastMsgCancel = mockSockVoteCancel.sentMessages[mockSockVoteCancel.sentMessages.length - 1]
+        assert.ok(lastMsgCancel.content.text.includes('Reporte cancelado'), 'Debe enviar mensaje de confirmación de cancelación')
 
-        // 13d: Conservación de comandos de texto escritos como alternativa (1 / 0)
+        // 13e: Conservación de comandos de texto escritos como alternativa (1 / LISTO / 0 / CANCELAR)
         const userTextFallback = '595989993333@s.whatsapp.net'
         deleteSession(userTextFallback)
         db.prepare(`
@@ -580,10 +644,34 @@ async function runTests() {
         const sessionAfterText = db.prepare('SELECT state FROM report_sessions WHERE user_jid = ?').get(userTextFallback)
         assert.strictEqual(sessionAfterText?.state, 'AWAITING_DESCRIPTION', 'Comando escrito LISTO debe funcionar exactamente igual')
 
-        deleteSession(userBtnContinue)
-        deleteSession(userTextFallback)
+        // 13f: Compatibilidad con botones interactivos nativos si son emitidos por algún cliente
+        const userBtnCompat = '595989994444@s.whatsapp.net'
+        deleteSession(userBtnCompat)
+        db.prepare(`
+            INSERT INTO report_sessions (user_jid, state, updated_at)
+            VALUES (?, 'AWAITING_AFFECTATIONS_AND_DESC', datetime('now'))
+        `).run(userBtnCompat)
 
-        console.log('  ✅ Test 13 aprobado: Botones interactivos y comandos de texto alternativos 100% operativos.\n')
+        const mockSockBtnCompat = createMockSocket()
+        await handleFloodReportFlow(mockSockBtnCompat, userBtnCompat, {
+            key: { remoteJid: userBtnCompat, id: 'MSG_BTN_COMPAT' },
+            message: {
+                interactiveResponseMessage: {
+                    nativeFlowResponseMessage: {
+                        paramsJson: JSON.stringify({ id: '1', display_text: 'Continuar' })
+                    }
+                }
+            }
+        })
+        const sessionAfterBtnCompat = db.prepare('SELECT state FROM report_sessions WHERE user_jid = ?').get(userBtnCompat)
+        assert.strictEqual(sessionAfterBtnCompat?.state, 'AWAITING_DESCRIPTION', 'interactiveResponseMessage debe ser compatible')
+
+        deleteSession(userPollContinue)
+        deleteSession(userPollCancel)
+        deleteSession(userTextFallback)
+        deleteSession(userBtnCompat)
+
+        console.log('  ✅ Test 13 aprobado: Encuesta interactiva nativa (Continuar / Cancelar) y comandos de texto alternativos 100% operativos.\n')
         passedTests++
 
         // --------------------------------------------------------------------------
