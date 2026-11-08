@@ -1,6 +1,6 @@
 # Guía de Instalación y Despliegue en Servidor Linux
 
-Esta guía contiene los pasos exactos y secuenciales para clonar, configurar, vincular y ejecutar **FloodBot** en el servidor de laboratorio de la facultad.
+Esta guía contiene los pasos exactos y secuenciales para clonar, configurar, vincular y ejecutar **FloodBot** en el servidor.
 
 ---
 
@@ -161,3 +161,4 @@ floodbot-baileys-whatsapp/
 ├── sessions.db           # Base SQLite local para persistencia de estados
 └── supabaseClient.js     # Cliente de integración con Supabase
 ```
+
