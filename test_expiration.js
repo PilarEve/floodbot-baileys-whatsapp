@@ -47,13 +47,10 @@ const {
     handleFloodReportFlow,
     UPLOADS_DIR,
     DB_PATH,
-    DECISION_INTERFACE_MODE,
-    sendContinueOrCancelInterface,
     CONFIRMATION_INTERFACE_MODE,
     sendReportConfirmationInterface,
     executeReportConfirmation,
-    EXPERIMENTAL_BUTTONS_ENABLED,
-    sendContinueOrCancelButtons
+    sendAffectationPoll
 } = require('./bot')
 
 const { insertReportRecord } = require('./supabaseClient')
@@ -532,149 +529,138 @@ async function runTests() {
         passedTests++
 
         // --------------------------------------------------------------------------
-        // Test 13: Interfaz interactiva nativa (Continuar / Cancelar) y fallback a texto
+        // Test 13: Avance directo a descripción opcional tras afectaciones (sin pregunta intermedia)
         // --------------------------------------------------------------------------
-        console.log('▶️ Test 13: Encuesta interactiva nativa (Continuar / Cancelar) y comandos de texto...')
+        console.log('▶️ Test 13: Avance directo a descripción opcional tras afectaciones (sin pregunta intermedia)...')
 
-        // 13a: Envío de encuesta interactiva nativa (modo 'POLL' activo por defecto)
-        const testUserPoll = '595987778888@s.whatsapp.net'
-        const mockSockPoll = createMockSocket()
-        const sentPollMsg = await sendContinueOrCancelInterface(mockSockPoll, testUserPoll)
-
-        assert.ok(mockSockPoll.sentMessages.length > 0, 'Debe haber enviado un mensaje')
-        const sentPollContent = mockSockPoll.sentMessages[0].content
-        assert.ok(sentPollContent.poll, 'Debe enviar una encuesta nativa de WhatsApp')
-        assert.strictEqual(sentPollContent.poll.name, '👉 ¿Deseás continuar con el reporte?')
-        assert.deepStrictEqual(sentPollContent.poll.values, ['1. Continuar', '0. Cancelar'])
-        assert.strictEqual(sentPollContent.poll.selectableCount, 1, 'Debe permitir seleccionar solo una opción')
-        assert.ok(global.pollRegistry.has(sentPollMsg.key.id), 'Debe registrar la encuesta en global.pollRegistry')
-        const regEntry = global.pollRegistry.get(sentPollMsg.key.id)
-        assert.strictEqual(regEntry.type, 'DECISION')
-
-        // 13b: Modo tradicional de texto plano (reversibilidad rápida mediante modeOverride = 'TEXT')
-        const mockSockClassic = createMockSocket()
-        await sendContinueOrCancelInterface(mockSockClassic, testUserPoll, 'TEXT')
-        assert.ok(mockSockClassic.sentMessages[0].content.text.includes('Respondé *1* o *LISTO*'), 'Modo TEXT debe emitir texto clásico tradicional')
-
-        // 13c: Respuesta seleccionando "1. Continuar" en la encuesta interactiva
-        const userPollContinue = '595989991111@s.whatsapp.net'
-        deleteSession(userPollContinue)
+        // 13a: Envío de encuesta de afectaciones e inmediatamente solicitud de descripción opcional
+        const testUserDirect = '595987778888@s.whatsapp.net'
+        deleteSession(testUserDirect)
         db.prepare(`
             INSERT INTO report_sessions (user_jid, state, updated_at)
-            VALUES (?, 'AWAITING_AFFECTATIONS_AND_DESC', datetime('now'))
-        `).run(userPollContinue)
+            VALUES (?, 'AWAITING_PHOTO', datetime('now'))
+        `).run(testUserDirect)
 
-        const mockSockVoteContinue = createMockSocket()
-        const decMsgContinue = await sendContinueOrCancelInterface(mockSockVoteContinue, userPollContinue, 'POLL')
-        const voteEncContinue = generateEncryptedPollVote({
-            pollMsgId: decMsgContinue.key.id,
-            pollCreatorJid: mockSockVoteContinue.user.id,
-            voterJid: userPollContinue,
-            pollEncKey: Buffer.from(global.pollRegistry.get(decMsgContinue.key.id).encKeyHex, 'hex'),
-            selectedOptionText: '1. Continuar'
+        const mockSockDirect = createMockSocket()
+        await sendAffectationPoll(mockSockDirect, testUserDirect)
+
+        assert.strictEqual(mockSockDirect.sentMessages.length, 2, 'Debe haber enviado 2 mensajes: encuesta de afectaciones y directamente la descripción')
+        const firstMsg = mockSockDirect.sentMessages[0].content
+        assert.ok(firstMsg.poll, 'Primer mensaje debe ser la encuesta de afectaciones')
+        assert.strictEqual(firstMsg.poll.name, '⛈️ Seleccioná las afectaciones (Opcional):')
+
+        const secondMsg = mockSockDirect.sentMessages[1].content
+        assert.ok(secondMsg.text.includes('Descripción del incidente (opcional)'), 'Segundo mensaje debe ser la solicitud de descripción directa')
+        assert.ok(secondMsg.text.includes('respondé *1* para omitir'), 'Debe indicar que 1 es para omitir')
+
+        // 13b: El voto en la encuesta de afectaciones actualiza silenciosamente SQLite
+        const pollEntry = Array.from(global.pollRegistry.entries()).find(([_, v]) => v.userJid === testUserDirect && v.type === 'AFFECTATIONS')
+        assert.ok(pollEntry, 'Debe registrar la encuesta de afectaciones en global.pollRegistry')
+        const [affectationPollId, affectationReg] = pollEntry
+
+        const voteEncAffectations = generateEncryptedPollVote({
+            pollMsgId: affectationPollId,
+            pollCreatorJid: mockSockDirect.user.id,
+            voterJid: testUserDirect,
+            pollEncKey: Buffer.from(affectationReg.encKeyHex, 'hex'),
+            selectedOptionText: '1. Calle inundada'
         })
 
-        await handleFloodReportFlow(mockSockVoteContinue, userPollContinue, {
-            key: { remoteJid: userPollContinue, id: 'MSG_VOTE_CONT_1' },
+        // El usuario está en AWAITING_DESCRIPTION
+        db.prepare(`
+            UPDATE report_sessions
+            SET state = 'AWAITING_DESCRIPTION',
+                updated_at = datetime('now')
+            WHERE user_jid = ?
+        `).run(testUserDirect)
+
+        await handleFloodReportFlow(mockSockDirect, testUserDirect, {
+            key: { remoteJid: testUserDirect, id: 'MSG_VOTE_AFF_1' },
             message: {
                 pollUpdateMessage: {
                     pollCreationMessageKey: {
-                        id: decMsgContinue.key.id,
-                        remoteJid: userPollContinue,
+                        id: affectationPollId,
+                        remoteJid: testUserDirect,
                         fromMe: true
                     },
-                    vote: voteEncContinue
+                    vote: voteEncAffectations
                 }
             }
         })
 
-        const sessionAfterVoteContinue = db.prepare('SELECT state FROM report_sessions WHERE user_jid = ?').get(userPollContinue)
-        assert.strictEqual(sessionAfterVoteContinue?.state, 'AWAITING_DESCRIPTION', 'Votar Continuar en encuesta debe avanzar a AWAITING_DESCRIPTION')
-        const lastMsgContinue = mockSockVoteContinue.sentMessages[mockSockVoteContinue.sentMessages.length - 1]
-        assert.ok(lastMsgContinue.content.text.includes('Descripción'), 'Debe solicitar descripción del incidente')
+        const sessionAfterAffVote = db.prepare('SELECT selected_affectations, state FROM report_sessions WHERE user_jid = ?').get(testUserDirect)
+        assert.strictEqual(sessionAfterAffVote.state, 'AWAITING_DESCRIPTION', 'Debe mantenerse en AWAITING_DESCRIPTION')
+        assert.ok(sessionAfterAffVote.selected_affectations.includes('Calle inundada'), 'Debe guardar la afectación seleccionada silenciosamente')
 
-        // 13d: Respuesta seleccionando "0. Cancelar" en la encuesta interactiva
-        const userPollCancel = '595989992222@s.whatsapp.net'
-        deleteSession(userPollCancel)
+        // 13c: Enviar descripción en texto avanza directamente a AWAITING_CONFIRMATION y emite el resumen
+        const mockSockDesc = createMockSocket()
+        await handleFloodReportFlow(mockSockDesc, testUserDirect, {
+            key: { remoteJid: testUserDirect, id: 'MSG_DESC_TEXT' },
+            message: { conversation: 'El agua sobrepasó la vereda y entró a la cochera' }
+        })
+
+        const sessionAfterDesc = db.prepare('SELECT state, description FROM report_sessions WHERE user_jid = ?').get(testUserDirect)
+        assert.strictEqual(sessionAfterDesc.state, 'AWAITING_CONFIRMATION', 'Enviar descripción debe avanzar a AWAITING_CONFIRMATION')
+        assert.strictEqual(sessionAfterDesc.description, 'El agua sobrepasó la vereda y entró a la cochera')
+        assert.ok(mockSockDesc.sentMessages.length > 0, 'Debe haber emitido el resumen de confirmación')
+
+        // 13d: Omitir descripción respondiendo 1 avanza directamente a AWAITING_CONFIRMATION
+        const userOmit = '595987779999@s.whatsapp.net'
+        deleteSession(userOmit)
+        db.prepare(`
+            INSERT INTO report_sessions (user_jid, state, updated_at)
+            VALUES (?, 'AWAITING_DESCRIPTION', datetime('now'))
+        `).run(userOmit)
+
+        const mockSockOmit = createMockSocket()
+        await handleFloodReportFlow(mockSockOmit, userOmit, {
+            key: { remoteJid: userOmit, id: 'MSG_OMIT_1' },
+            message: { conversation: '1' }
+        })
+
+        const sessionAfterOmit = db.prepare('SELECT state, description FROM report_sessions WHERE user_jid = ?').get(userOmit)
+        assert.strictEqual(sessionAfterOmit.state, 'AWAITING_CONFIRMATION', 'Responder 1 debe avanzar a AWAITING_CONFIRMATION')
+        assert.strictEqual(sessionAfterOmit.description, null, 'Descripción debe ser null al omitir')
+
+        // 13e: Cancelar en AWAITING_DESCRIPTION elimina la sesión
+        const userCancel13 = '595987770000@s.whatsapp.net'
+        deleteSession(userCancel13)
+        db.prepare(`
+            INSERT INTO report_sessions (user_jid, state, updated_at)
+            VALUES (?, 'AWAITING_DESCRIPTION', datetime('now'))
+        `).run(userCancel13)
+
+        const mockSockCancel13 = createMockSocket()
+        await handleFloodReportFlow(mockSockCancel13, userCancel13, {
+            key: { remoteJid: userCancel13, id: 'MSG_CANCEL_0' },
+            message: { conversation: 'CANCELAR' }
+        })
+
+        const sessionAfterCancel = db.prepare('SELECT state FROM report_sessions WHERE user_jid = ?').get(userCancel13)
+        assert.strictEqual(sessionAfterCancel, undefined, 'Escribir CANCELAR debe eliminar la sesión')
+
+        // 13f: Compatibilidad con sesiones recuperadas en AWAITING_AFFECTATIONS_AND_DESC
+        const userLegacy = '595987771111@s.whatsapp.net'
+        deleteSession(userLegacy)
         db.prepare(`
             INSERT INTO report_sessions (user_jid, state, updated_at)
             VALUES (?, 'AWAITING_AFFECTATIONS_AND_DESC', datetime('now'))
-        `).run(userPollCancel)
+        `).run(userLegacy)
 
-        const mockSockVoteCancel = createMockSocket()
-        const decMsgCancel = await sendContinueOrCancelInterface(mockSockVoteCancel, userPollCancel, 'POLL')
-        const voteEncCancel = generateEncryptedPollVote({
-            pollMsgId: decMsgCancel.key.id,
-            pollCreatorJid: mockSockVoteCancel.user.id,
-            voterJid: userPollCancel,
-            pollEncKey: Buffer.from(global.pollRegistry.get(decMsgCancel.key.id).encKeyHex, 'hex'),
-            selectedOptionText: '0. Cancelar'
+        const mockSockLegacy = createMockSocket()
+        await handleFloodReportFlow(mockSockLegacy, userLegacy, {
+            key: { remoteJid: userLegacy, id: 'MSG_LEGACY_1' },
+            message: { conversation: '1' }
         })
+        const sessionAfterLegacy = db.prepare('SELECT state FROM report_sessions WHERE user_jid = ?').get(userLegacy)
+        assert.strictEqual(sessionAfterLegacy.state, 'AWAITING_CONFIRMATION', 'Sesión recuperada en AWAITING_AFFECTATIONS_AND_DESC debe avanzar fluidamente')
 
-        await handleFloodReportFlow(mockSockVoteCancel, userPollCancel, {
-            key: { remoteJid: userPollCancel, id: 'MSG_VOTE_CANC_1' },
-            message: {
-                pollUpdateMessage: {
-                    pollCreationMessageKey: {
-                        id: decMsgCancel.key.id,
-                        remoteJid: userPollCancel,
-                        fromMe: true
-                    },
-                    vote: voteEncCancel
-                }
-            }
-        })
+        deleteSession(testUserDirect)
+        deleteSession(userOmit)
+        deleteSession(userCancel13)
+        deleteSession(userLegacy)
 
-        const sessionAfterVoteCancel = db.prepare('SELECT state FROM report_sessions WHERE user_jid = ?').get(userPollCancel)
-        assert.strictEqual(sessionAfterVoteCancel, undefined, 'Votar Cancelar en encuesta debe eliminar la sesión')
-        const lastMsgCancel = mockSockVoteCancel.sentMessages[mockSockVoteCancel.sentMessages.length - 1]
-        assert.ok(lastMsgCancel.content.text.includes('Reporte cancelado'), 'Debe enviar mensaje de confirmación de cancelación')
-
-        // 13e: Conservación de comandos de texto escritos como alternativa (1 / LISTO / 0 / CANCELAR)
-        const userTextFallback = '595989993333@s.whatsapp.net'
-        deleteSession(userTextFallback)
-        db.prepare(`
-            INSERT INTO report_sessions (user_jid, state, updated_at)
-            VALUES (?, 'AWAITING_AFFECTATIONS_AND_DESC', datetime('now'))
-        `).run(userTextFallback)
-
-        const mockSockTextFallback = createMockSocket()
-        await handleFloodReportFlow(mockSockTextFallback, userTextFallback, {
-            key: { remoteJid: userTextFallback, id: 'MSG_TEXT_1' },
-            message: { conversation: 'LISTO' }
-        })
-
-        const sessionAfterText = db.prepare('SELECT state FROM report_sessions WHERE user_jid = ?').get(userTextFallback)
-        assert.strictEqual(sessionAfterText?.state, 'AWAITING_DESCRIPTION', 'Comando escrito LISTO debe funcionar exactamente igual')
-
-        // 13f: Compatibilidad con botones interactivos nativos si son emitidos por algún cliente
-        const userBtnCompat = '595989994444@s.whatsapp.net'
-        deleteSession(userBtnCompat)
-        db.prepare(`
-            INSERT INTO report_sessions (user_jid, state, updated_at)
-            VALUES (?, 'AWAITING_AFFECTATIONS_AND_DESC', datetime('now'))
-        `).run(userBtnCompat)
-
-        const mockSockBtnCompat = createMockSocket()
-        await handleFloodReportFlow(mockSockBtnCompat, userBtnCompat, {
-            key: { remoteJid: userBtnCompat, id: 'MSG_BTN_COMPAT' },
-            message: {
-                interactiveResponseMessage: {
-                    nativeFlowResponseMessage: {
-                        paramsJson: JSON.stringify({ id: '1', display_text: 'Continuar' })
-                    }
-                }
-            }
-        })
-        const sessionAfterBtnCompat = db.prepare('SELECT state FROM report_sessions WHERE user_jid = ?').get(userBtnCompat)
-        assert.strictEqual(sessionAfterBtnCompat?.state, 'AWAITING_DESCRIPTION', 'interactiveResponseMessage debe ser compatible')
-
-        deleteSession(userPollContinue)
-        deleteSession(userPollCancel)
-        deleteSession(userTextFallback)
-        deleteSession(userBtnCompat)
-
-        console.log('  ✅ Test 13 aprobado: Encuesta interactiva nativa (Continuar / Cancelar) y comandos de texto alternativos 100% operativos.\n')
+        console.log('  ✅ Test 13 aprobado: Avance directo a descripción opcional tras afectaciones 100% verificado.\n')
         passedTests++
 
         // --------------------------------------------------------------------------

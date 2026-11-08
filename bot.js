@@ -476,59 +476,15 @@ function askQuestion(query) {
 }
 
 // ==============================================================================
-// CONFIGURACIÓN DE INTERFACES SELECCIONABLES (ENCUESTAS INTERACTIVAS NATIVAS)
+// CONFIGURACIÓN DE INTERFAZ DE CONFIRMACIÓN (ENCUESTA INTERACTIVA NATIVA)
 // ==============================================================================
-// Modalidades admitidas (Condición 10):
-// - 'POLL': Encuesta interactiva nativa de WhatsApp de selección única.
-//           100% admitida por Meta en todos los dispositivos y cuentas personales.
-// - 'TEXT': Mensaje tradicional de texto plano.
-const DECISION_INTERFACE_MODE = 'POLL'
+// Modalidades admitidas para la confirmación del reporte:
+// - 'POLL': Resumen de texto + Encuesta interactiva nativa de 2 opciones ('1. Confirmar y enviar' y '0. Cancelar').
+// - 'TEXT': Mensaje tradicional de texto plano ("Respondé 1 o CONFIRMAR...").
 const CONFIRMATION_INTERFACE_MODE = 'POLL'
 
 // Registro en memoria de encuestas activas para asociar ID con su clave de descifrado y tipo
 if (!global.pollRegistry) global.pollRegistry = new Map()
-
-// Envío de interfaz interactiva o texto tradicional según configuración (Continuar / Cancelar)
-async function sendContinueOrCancelInterface(sock, sender, modeOverride = null) {
-    const mode = modeOverride || DECISION_INTERFACE_MODE
-
-    if (mode === 'POLL') {
-        try {
-            const decisionMsg = await sock.sendMessage(sender, {
-                poll: {
-                    name: '👉 ¿Deseás continuar con el reporte?',
-                    values: ['1. Continuar', '0. Cancelar'],
-                    selectableCount: 1
-                }
-            })
-
-            if (decisionMsg?.key?.id) {
-                const messageSecret = decisionMsg.message?.messageContextInfo?.messageSecret
-                if (messageSecret) {
-                    const encKeyHex = Buffer.isBuffer(messageSecret)
-                        ? messageSecret.toString('hex')
-                        : Buffer.from(messageSecret, 'base64').toString('hex')
-
-                    global.pollRegistry.set(decisionMsg.key.id, {
-                        type: 'DECISION',
-                        encKeyHex,
-                        userJid: sender
-                    })
-                }
-            }
-            addLog('message_out', `Encuesta interactiva de decisión (Continuar / Cancelar) enviada a ${sender}`)
-            return decisionMsg
-        } catch (err) {
-            addLog('warn', `Fallo al enviar encuesta de decisión (${err.message}). Utilizando texto alternativo.`)
-        }
-    }
-
-    // Modo TEXT o Fallback seguro
-    const classicText = `👉 Respondé *1* o *LISTO* para continuar.\n👉 Respondé *0* o *CANCELAR* para salir.`
-    const sent = await sock.sendMessage(sender, { text: classicText })
-    addLog('message_out', `Instrucciones de texto clásico enviadas a ${sender}`)
-    return sent
-}
 
 // Envío de interfaz de confirmación de reporte (resumen + encuesta táctil o texto clásico)
 async function sendReportConfirmationInterface(sock, sender, currentSession, modeOverride = null) {
@@ -655,7 +611,7 @@ async function executeReportConfirmation(sock, sender, session) {
     return true
 }
 
-// Envío de encuesta interactiva de WhatsApp para afectaciones y opciones de decisión
+// Envío de encuesta interactiva de WhatsApp para afectaciones y solicitud directa de descripción
 async function sendAffectationPoll(sock, sender) {
     let pollMsgId = null
     let pollEncKeyHex = null
@@ -697,7 +653,10 @@ async function sendAffectationPoll(sock, sender) {
         })
     }
 
-    await sendContinueOrCancelInterface(sock, sender)
+    // Directamente al mensaje de descripción opcional (sin pregunta intermedia)
+    const descPrompt = `✍️ *Descripción del incidente (opcional)*\n\n¿Querés agregar algún detalle sobre lo ocurrido?\n\n👉 Escribí tu descripción o respondé *1* para omitir.`
+    await sock.sendMessage(sender, { text: descPrompt })
+    addLog('message_out', `Solicitud de descripción enviada a ${sender}`)
 }
 
 // Control del flujo conversacional para el reporte de inundaciones
@@ -913,38 +872,7 @@ async function handleFloodReportFlow(sock, sender, msg) {
                         if (decrypted && decrypted.selectedOptions) {
                             const selectedHashes = decrypted.selectedOptions.map(opt => Buffer.from(opt).toString('hex'))
 
-                            // 1. Si el voto corresponde a la encuesta interactiva de decisión (Continuar / Cancelar)
-                            if (pollType === 'DECISION') {
-                                const hashContinue1 = crypto.createHash('sha256').update('1. Continuar').digest('hex')
-                                const hashContinue2 = crypto.createHash('sha256').update('Continuar').digest('hex')
-                                const hashCancel1 = crypto.createHash('sha256').update('0. Cancelar').digest('hex')
-                                const hashCancel2 = crypto.createHash('sha256').update('Cancelar').digest('hex')
-
-                                if (selectedHashes.includes(hashContinue1) || selectedHashes.includes(hashContinue2)) {
-                                    addLog('info', `✅ Opción 'Continuar' seleccionada en encuesta interactiva por ${sender}`)
-                                    db.prepare(`
-                                        UPDATE report_sessions
-                                        SET state = 'AWAITING_DESCRIPTION',
-                                            updated_at = CURRENT_TIMESTAMP
-                                        WHERE user_jid = ?
-                                    `).run(sender)
-
-                                    const descPrompt = `✍️ *Descripción del incidente (opcional)*\n\n¿Querés agregar algún detalle sobre lo ocurrido?\n\n👉 Escribí tu descripción o respondé *1* para omitir.`
-                                    await sock.sendMessage(sender, { text: descPrompt })
-                                    addLog('message_out', `Solicitud de descripción enviada a ${sender}`)
-                                    return true
-                                }
-
-                                if (selectedHashes.includes(hashCancel1) || selectedHashes.includes(hashCancel2)) {
-                                    addLog('info', `❌ Opción 'Cancelar' seleccionada en encuesta interactiva por ${sender}`)
-                                    deleteSession(sender)
-                                    const cancelMsg = 'Reporte cancelado. Escribí *REPORTAR* cuando quieras comenzar de nuevo.'
-                                    await sock.sendMessage(sender, { text: cancelMsg })
-                                    return true
-                                }
-                            }
-
-                            // 2. Si el voto corresponde a la encuesta interactiva de confirmación (Confirmar / Cancelar)
+                            // 1. Si el voto corresponde a la encuesta interactiva de confirmación (Confirmar / Cancelar)
                             if (pollType === 'CONFIRMATION') {
                                 const hashConfirm1 = crypto.createHash('sha256').update('1. Confirmar y enviar').digest('hex')
                                 const hashConfirm2 = crypto.createHash('sha256').update('Confirmar y enviar').digest('hex')
@@ -1045,7 +973,7 @@ async function handleFloodReportFlow(sock, sender, msg) {
 
                 db.prepare(`
                     UPDATE report_sessions
-                    SET state = 'AWAITING_AFFECTATIONS_AND_DESC',
+                    SET state = 'AWAITING_DESCRIPTION',
                         photo_path = ?,
                         updated_at = CURRENT_TIMESTAMP
                     WHERE user_jid = ?
@@ -1069,7 +997,7 @@ async function handleFloodReportFlow(sock, sender, msg) {
         return true
     }
 
-    // 4. Estado: AWAITING_AFFECTATIONS_AND_DESC (Afectaciones y descripción opcional)
+    // 4. Estado: AWAITING_AFFECTATIONS_AND_DESC (Compatibilidad con sesiones existentes)
     if (session.state === 'AWAITING_AFFECTATIONS_AND_DESC') {
         if (text === '0' || lowerText === 'cancelar') {
             deleteSession(sender)
@@ -1078,74 +1006,36 @@ async function handleFloodReportFlow(sock, sender, msg) {
             return true
         }
 
-        if (text === '1' || lowerText === 'listo' || lowerText === 'continuar') {
+        if (text === '1' || lowerText === 'omitir' || lowerText === 'listo' || lowerText === 'continuar') {
             db.prepare(`
                 UPDATE report_sessions
-                SET state = 'AWAITING_DESCRIPTION',
+                SET state = 'AWAITING_CONFIRMATION',
+                    description = NULL,
                     updated_at = CURRENT_TIMESTAMP
                 WHERE user_jid = ?
             `).run(sender)
 
-            const descPrompt = `✍️ *Descripción del incidente (opcional)*\n\n¿Querés agregar algún detalle sobre lo ocurrido?\n\n👉 Escribí tu descripción o respondé *1* para omitir.`
-            await sock.sendMessage(sender, { text: descPrompt })
-            addLog('message_out', `Solicitud de descripción enviada a ${sender}`)
+            await sendReportSummary()
             return true
         }
 
-        // Selección por números de texto (ej: "1, 4" o "3")
-        const rawNumbers = text.match(/\b\d+\b/g)
-        const isOnlyNumbers = /^[\d\s,.-]+$/.test(text)
-        if (rawNumbers && isOnlyNumbers && !(rawNumbers.length === 1 && rawNumbers[0] === '1')) {
-            const validIndices = []
-            for (const numStr of rawNumbers) {
-                const num = parseInt(numStr, 10)
-                if (num >= 1 && num <= AFFECTATION_CATEGORIES.length && !validIndices.includes(num)) {
-                    validIndices.push(num)
-                }
-            }
-
-            if (validIndices.length > 0) {
-                const selectedCategories = validIndices.map(i => AFFECTATION_CATEGORIES[i - 1])
-                db.prepare(`
-                    UPDATE report_sessions
-                    SET selected_affectations = ?,
-                        updated_at = CURRENT_TIMESTAMP
-                    WHERE user_jid = ?
-                `).run(JSON.stringify(selectedCategories), sender)
-
-                const numConfirm = `Afectaciones registradas: ${selectedCategories.join(', ')}.\n\n👉 Respondé *1* o *LISTO* para continuar.\n👉 Respondé *0* o *CANCELAR* para salir.`
-                await sock.sendMessage(sender, { text: numConfirm })
-                return true
-            }
-        }
-
-        // Detección por texto coincidente con categorías oficiales (ej: "calle inundada", "árbol caído")
-        const matchedCategories = AFFECTATION_CATEGORIES.filter(cat =>
-            lowerText.includes(cat.toLowerCase())
-        )
-        if (matchedCategories.length > 0) {
-            let currentList = []
-            try {
-                currentList = JSON.parse(session.selected_affectations || '[]')
-            } catch (_) {}
-            const merged = Array.from(new Set([...currentList, ...matchedCategories]))
+        if (text.length > 0) {
             db.prepare(`
                 UPDATE report_sessions
-                SET selected_affectations = ?,
+                SET state = 'AWAITING_CONFIRMATION',
+                    description = ?,
                     updated_at = CURRENT_TIMESTAMP
                 WHERE user_jid = ?
-            `).run(JSON.stringify(merged), sender)
+            `).run(text, sender)
 
-            addLog('info', `Afectaciones registradas por texto para ${sender}: ${merged.join(', ')}`)
-
-            const numConfirm = `Afectaciones registradas: ${merged.join(', ')}.\n\n👉 Respondé *1* o *LISTO* para continuar.\n👉 Respondé *0* o *CANCELAR* para salir.`
-            await sock.sendMessage(sender, { text: numConfirm })
+            addLog('info', `Descripción guardada para ${sender}: ${text}`)
+            await sendReportSummary()
             return true
         }
 
-        const helpStep = `👉 Respondé *1* o *LISTO* para continuar.\n👉 Respondé *0* o *CANCELAR* para salir.`
+        const helpDesc = `✍️ *Descripción del incidente (opcional)*\n\n¿Querés agregar algún detalle sobre lo ocurrido?\n\n👉 Escribí tu descripción o respondé *1* para omitir.`
         db.prepare('UPDATE report_sessions SET updated_at = CURRENT_TIMESTAMP WHERE user_jid = ?').run(sender)
-        await sock.sendMessage(sender, { text: helpStep })
+        await sock.sendMessage(sender, { text: helpDesc })
         return true
     }
 
@@ -1374,13 +1264,14 @@ if (process.env.NODE_ENV === 'test') {
         AFFECTATION_CATEGORIES,
         UPLOADS_DIR,
         DB_PATH,
-        DECISION_INTERFACE_MODE,
-        sendContinueOrCancelInterface,
         CONFIRMATION_INTERFACE_MODE,
         sendReportConfirmationInterface,
         executeReportConfirmation,
+        sendAffectationPoll,
+        DECISION_INTERFACE_MODE: null,
+        sendContinueOrCancelInterface: null,
         EXPERIMENTAL_BUTTONS_ENABLED: false,
-        sendContinueOrCancelButtons: sendContinueOrCancelInterface
+        sendContinueOrCancelButtons: null
     }
 }
 
