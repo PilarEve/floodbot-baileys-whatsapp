@@ -236,21 +236,37 @@ async function insertReportRecord(reportData) {
         const lat = Number(reportData.latitud ?? reportData.latitude)
         const lng = Number(reportData.longitud ?? reportData.longitude)
 
+        // Validación obligatoria: imagen_url no puede ser nula ni vacía
+        const photoUrl = reportData.imagen_url ?? reportData.photoUrl ?? null
+        if (!photoUrl || typeof photoUrl !== 'string' || !photoUrl.startsWith('http')) {
+            return {
+                success: false,
+                error: 'Fotografía obligatoria: no se permite registrar reportes en Supabase sin imagen_url válida.'
+            }
+        }
+
         const row = {
             latitud: isNaN(lat) ? null : lat,
             longitud: isNaN(lng) ? null : lng,
             descripcion: reportData.descripcion ?? reportData.description ?? 'Sin descripción',
-            imagen_url: reportData.imagen_url ?? reportData.photoUrl ?? reportData.photo_path ?? null,
+            imagen_url: photoUrl,
             estado: reportData.estado || 'pendiente',
             afectaciones: afectacionesArray,
             archivo_tipo: reportData.archivo_tipo || 'image/jpeg',
-            creado_en: new Date().toISOString()
+            creado_en: reportData.creado_en || new Date().toISOString()
         }
 
-        const { data, error } = await supabase
-            .from(SUPABASE_TABLE_REPORTS)
-            .insert(row)
-            .select()
+        // Si se provee id (UUID persistente), asignarlo explícitamente a la fila
+        if (reportData.id) {
+            row.id = reportData.id
+        }
+
+        // Si row.id está presente, usar upsert con onConflict: 'id' para garantizar idempotencia total ante reintentos
+        const query = row.id
+            ? supabase.from(SUPABASE_TABLE_REPORTS).upsert(row, { onConflict: 'id' }).select()
+            : supabase.from(SUPABASE_TABLE_REPORTS).insert(row).select()
+
+        const { data, error } = await query
 
         if (error) {
             return { success: false, error: error.message }
@@ -291,10 +307,22 @@ async function syncReportToSupabase(sessionData) {
         } else if (sessionData.photo_path && sessionData.photo_path.startsWith('http')) {
             // Ya es una URL remota
             photoPublicUrl = sessionData.photo_path
+        } else if (sessionData.storage_url) {
+            // Reutilizar storage_url persistido
+            photoPublicUrl = sessionData.storage_url
         }
 
-        // 2. Insertar registro en la tabla
+        // Impedir reportes sin fotografía: no insertar si no hay evidencia válida
+        if (!photoPublicUrl) {
+            return {
+                success: false,
+                error: 'Fotografía obligatoria: el reporte no cuenta con archivo físico local ni storage_url.'
+            }
+        }
+
+        // 2. Insertar registro en la tabla con id persistente para evitar duplicados
         const insertRes = await insertReportRecord({
+            id: sessionData.id,
             latitude: sessionData.latitude,
             longitude: sessionData.longitude,
             description: sessionData.description,

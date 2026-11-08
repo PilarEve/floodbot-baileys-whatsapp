@@ -47,7 +47,9 @@ const {
     DB_PATH
 } = require('./bot')
 
-console.log('🧪 Iniciando batería exhaustiva de pruebas (10 escenarios aislados)...\n')
+const { insertReportRecord } = require('./supabaseClient')
+
+console.log('🧪 Iniciando batería exhaustiva de pruebas (12 escenarios aislados)...\n')
 console.log(`📁 Directorio de pruebas aislado: ${testDir}`)
 console.log(`🗄️ Base de datos temporal: ${testDbPath}`)
 console.log(`📸 Carpeta temporal de uploads: ${testUploads}\n`)
@@ -394,10 +396,100 @@ async function runTests() {
         passedTests++
 
         // --------------------------------------------------------------------------
+        // Test 11: Idempotencia y prevención de duplicados con UUID persistente en Supabase
+        // --------------------------------------------------------------------------
+        console.log('▶️ Test 11: Identificación compartida por UUID persistente e idempotencia en Supabase...')
+        const persistentUuidTest11 = '11111111-2222-3333-4444-555555555555'
+        const photoTest11 = path.join(testUploads, `photo_uuid_${Date.now()}.jpg`)
+        fs.writeFileSync(photoTest11, 'photo uuid test data')
+
+        db.prepare(`
+            INSERT INTO pending_sync_reports (id, user_jid, latitude, longitude, photo_path, status, attempts, next_retry_at)
+            VALUES (?, '595981112222@s.whatsapp.net', -25.281, -57.641, ?, 'PENDING', 0, 0)
+        `).run(persistentUuidTest11, photoTest11)
+
+        let receivedInsertPayload = null
+        const mockDependenciesUuid = {
+            isSupabaseConfigured: () => true,
+            uploadReportPhoto: async () => ({ success: true, publicUrl: 'https://supabase.co/storage/photo11.jpg' }),
+            insertReportRecord: async (payload) => {
+                receivedInsertPayload = payload
+                return { success: true, data: { id: payload.id } }
+            }
+        }
+
+        const reportTest11 = db.prepare('SELECT * FROM pending_sync_reports WHERE id = ?').get(persistentUuidTest11)
+        const resTest11 = await processSinglePendingReport(reportTest11, mockDependenciesUuid)
+
+        assert.strictEqual(resTest11.success, true, 'El proceso debe completarse exitosamente')
+        assert.ok(receivedInsertPayload, 'insertReportRecord debió ser invocado')
+        assert.strictEqual(receivedInsertPayload.id, persistentUuidTest11, 'Supabase DEBE recibir exactamente el UUID persistente generado en SQLite')
+        assert.strictEqual(resTest11.remoteData.id, persistentUuidTest11, 'El registro retornado debe conservar el mismo UUID')
+
+        console.log('  ✅ Test 11 aprobado: UUID persistente compartido entre SQLite y Supabase garantiza idempotencia.\n')
+        passedTests++
+
+        // --------------------------------------------------------------------------
+        // Test 12: Impedir reportes sin fotografía (obligatoriedad estricta)
+        // --------------------------------------------------------------------------
+        console.log('▶️ Test 12: Impedir reportes sin fotografía (validación defensiva multinivel)...')
+
+        // 12a: Reporte en cola con archivo físico local faltante y sin URL en Storage
+        const missingPhotoUuid = '22222222-3333-4444-5555-666666666666'
+        const nonExistentPath = path.join(testUploads, 'non_existent_file_12345.jpg')
+        assert.strictEqual(fs.existsSync(nonExistentPath), false)
+
+        db.prepare(`
+            INSERT INTO pending_sync_reports (id, user_jid, latitude, longitude, photo_path, storage_url, status, attempts, next_retry_at)
+            VALUES (?, '595983334444@s.whatsapp.net', -25.285, -57.645, ?, NULL, 'PENDING', 0, 0)
+        `).run(missingPhotoUuid, nonExistentPath)
+
+        let wasDbInsertInvoked = false
+        const mockDependenciesMissingPhoto = {
+            isSupabaseConfigured: () => true,
+            uploadReportPhoto: async () => { throw new Error('No debe intentar subir si no existe el archivo') },
+            insertReportRecord: async () => {
+                wasDbInsertInvoked = true
+                return { success: true, data: { id: 'should_not_happen' } }
+            }
+        }
+
+        const reportMissingPhoto = db.prepare('SELECT * FROM pending_sync_reports WHERE id = ?').get(missingPhotoUuid)
+        const resMissingPhoto = await processSinglePendingReport(reportMissingPhoto, mockDependenciesMissingPhoto)
+
+        assert.strictEqual(resMissingPhoto.success, false, 'Debe rechazar sincronizar si falta la foto')
+        assert.strictEqual(resMissingPhoto.missingPhoto, true, 'Debe señalar flag de missingPhoto')
+        assert.strictEqual(wasDbInsertInvoked, false, 'NUNCA se debe invocar la inserción en base de datos si falta la foto')
+
+        // Verificar que el reporte se retiene en SQLite para auditoría manual
+        const reportInSqlite = db.prepare('SELECT status, last_error FROM pending_sync_reports WHERE id = ?').get(missingPhotoUuid)
+        assert.ok(reportInSqlite, 'El reporte incompleto DEBE conservarse en SQLite')
+        assert.strictEqual(reportInSqlite.status, 'FAILED_MISSING_PHOTO', 'El estado debe marcarse como FAILED_MISSING_PHOTO')
+        assert.ok(reportInSqlite.last_error.includes('Fotografía obligatoria no disponible'), 'Debe registrar detalle del error')
+
+        // 12b: Llamada directa a insertReportRecord en supabaseClient sin imagen válida
+        const directInsertResult = await insertReportRecord({
+            id: '33333333-4444-5555-6666-777777777777',
+            latitude: -25.28,
+            longitude: -57.64,
+            description: 'Prueba sin foto',
+            photoUrl: null
+        })
+
+        assert.strictEqual(directInsertResult.success, false, 'insertReportRecord debe rechazar registros sin fotoUrl')
+        assert.ok(directInsertResult.error.includes('Fotografía obligatoria'), 'El error debe indicar la obligatoriedad de la fotografía')
+
+        // Limpieza de registro de prueba
+        db.prepare('DELETE FROM pending_sync_reports WHERE id = ?').run(missingPhotoUuid)
+
+        console.log('  ✅ Test 12 aprobado: Bloqueo estricto de reportes sin fotografía verificado a nivel de cola y de API.\n')
+        passedTests++
+
+        // --------------------------------------------------------------------------
         // Resumen
         // --------------------------------------------------------------------------
         console.log('==============================================================================')
-        console.log(`🎉 BATERÍA COMPLETA: ${passedTests} de 10 pruebas aprobadas exitosamente.`)
+        console.log(`🎉 BATERÍA COMPLETA: ${passedTests} de 12 pruebas aprobadas exitosamente.`)
         console.log('🛡️ Aislamiento verificado: sessions.db y uploads/ reales no sufrieron modificaciones.')
         console.log('==============================================================================\n')
     } finally {

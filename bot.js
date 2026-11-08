@@ -284,9 +284,12 @@ async function processSinglePendingReport(report, customSyncDependencies = null)
     try {
         let photoPublicUrl = report.storage_url || null
 
-        // Paso A: Subida de fotografía a Storage (si existe y aún no fue subida)
-        if (!photoPublicUrl && report.photo_path) {
-            if (fs.existsSync(report.photo_path)) {
+        // Comprobación de existencia del archivo local
+        const hasLocalFile = Boolean(report.photo_path && typeof report.photo_path === 'string' && fs.existsSync(report.photo_path))
+
+        // Paso A: Subida de fotografía a Storage (si aún no tiene storage_url)
+        if (!photoPublicUrl) {
+            if (hasLocalFile) {
                 const uploadRes = await uploadPhotoFn(report.photo_path)
                 if (uploadRes && uploadRes.success && uploadRes.publicUrl) {
                     photoPublicUrl = uploadRes.publicUrl
@@ -313,12 +316,39 @@ async function processSinglePendingReport(report, customSyncDependencies = null)
                     return { success: false, error: uploadErr }
                 }
             } else {
-                addLog('warn', `⚠️ Foto local no encontrada en disco (${report.photo_path}). Continuando inserción sin foto.`)
+                // IMPEDIR REPORTES SIN FOTOGRAFÍA: La fotografía es obligatoria.
+                // Si el archivo local no existe y tampoco tenemos URL en Storage, no insertar el reporte incompleto.
+                const missingPhotoErr = `Fotografía obligatoria no disponible (ruta local no encontrada: ${report.photo_path || 'ninguna'} y sin storage_url)`
+                addLog('error', `⛔ Reporte ${report.id} retenido: ${missingPhotoErr}. No se inserta en Supabase.`)
+
+                db.prepare(`
+                    UPDATE pending_sync_reports
+                    SET status = 'FAILED_MISSING_PHOTO',
+                        last_error = ?,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                `).run(missingPhotoErr, report.id)
+
+                return { success: false, error: missingPhotoErr, missingPhoto: true }
             }
         }
 
-        // Paso B: Inserción en la base de datos de Supabase
+        // Validación final de seguridad antes del INSERT: bajo ninguna circunstancia insertar sin photoPublicUrl
+        if (!photoPublicUrl) {
+            const noUrlErr = 'Fotografía obligatoria: no se obtuvo URL válida de Storage'
+            db.prepare(`
+                UPDATE pending_sync_reports
+                SET status = 'FAILED_MISSING_PHOTO',
+                    last_error = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+            `).run(noUrlErr, report.id)
+            return { success: false, error: noUrlErr, missingPhoto: true }
+        }
+
+        // Paso B: Inserción idempotente en la base de datos de Supabase utilizando el UUID persistente
         const insertRes = await insertRecordFn({
+            id: report.id, // UUID compartido persistente entre SQLite y Supabase
             latitude: report.latitude,
             longitude: report.longitude,
             description: report.description,
@@ -933,7 +963,7 @@ async function handleFloodReportFlow(sock, sender, msg) {
                 return true
             }
 
-            const reportId = crypto.randomUUID ? crypto.randomUUID() : crypto.randomBytes(16).toString('hex')
+            const reportId = crypto.randomUUID()
 
             // 1. Guardar primero en pending_sync_reports
             try {
