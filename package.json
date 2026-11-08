@@ -1,0 +1,17 @@
+{
+  "name": "floodbot-baileys-whatsapp",
+  "version": "1.0.0",
+  "description": "Bot de WhatsApp para reporte ciudadano de inundaciones urbanas con Baileys y Supabase",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js"
+  },
+  "dependencies": {
+    "@hapi/boom": "^10.0.1",
+    "@supabase/supabase-js": "^2.117.3",
+    "@whiskeysockets/baileys": "^7.0.0-rc.9",
+    "better-sqlite3": "^12.6.2",
+    "dotenv": "^18.0.7",
+    "pino": "^10.2.0"
+  }
+}

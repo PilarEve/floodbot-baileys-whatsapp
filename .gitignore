@@ -1,0 +1,48 @@
+# Dependencies
+node_modules/
+dashboard/node_modules/
+
+# Database and logs
+logs.db
+logs.db-journal
+sessions.db
+sessions.db-journal
+*.db
+*.log
+
+# WhatsApp session data (sensitive!)
+auth_info_baileys/
+auth_info_baileys_respaldo/
+
+# Uploads
+uploads/
+
+# Environment files
+.env
+.env.local
+.env.*.local
+.github_credentials
+
+# Build output
+dashboard/dist/
+
+# Docker data
+data/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Documentation (local only)
+docs/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Debug
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
