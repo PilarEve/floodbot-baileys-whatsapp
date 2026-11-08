@@ -476,18 +476,19 @@ function askQuestion(query) {
 }
 
 // ==============================================================================
-// CONFIGURACIÓN DE INTERFAZ SELECCIONABLE (CONTINUAR / CANCELAR)
+// CONFIGURACIÓN DE INTERFACES SELECCIONABLES (ENCUESTAS INTERACTIVAS NATIVAS)
 // ==============================================================================
 // Modalidades admitidas (Condición 10):
-// - 'POLL': Encuesta interactiva nativa de WhatsApp con 2 opciones ('1. Continuar' y '0. Cancelar').
+// - 'POLL': Encuesta interactiva nativa de WhatsApp de selección única.
 //           100% admitida por Meta en todos los dispositivos y cuentas personales.
-// - 'TEXT': Mensaje tradicional de texto plano ("Respondé 1 o LISTO...").
+// - 'TEXT': Mensaje tradicional de texto plano.
 const DECISION_INTERFACE_MODE = 'POLL'
+const CONFIRMATION_INTERFACE_MODE = 'POLL'
 
 // Registro en memoria de encuestas activas para asociar ID con su clave de descifrado y tipo
 if (!global.pollRegistry) global.pollRegistry = new Map()
 
-// Envío de interfaz interactiva o texto tradicional según configuración
+// Envío de interfaz interactiva o texto tradicional según configuración (Continuar / Cancelar)
 async function sendContinueOrCancelInterface(sock, sender, modeOverride = null) {
     const mode = modeOverride || DECISION_INTERFACE_MODE
 
@@ -527,6 +528,131 @@ async function sendContinueOrCancelInterface(sock, sender, modeOverride = null) 
     const sent = await sock.sendMessage(sender, { text: classicText })
     addLog('message_out', `Instrucciones de texto clásico enviadas a ${sender}`)
     return sent
+}
+
+// Envío de interfaz de confirmación de reporte (resumen + encuesta táctil o texto clásico)
+async function sendReportConfirmationInterface(sock, sender, currentSession, modeOverride = null) {
+    const mode = modeOverride || CONFIRMATION_INTERFACE_MODE
+
+    let affectationsList = []
+    try {
+        if (currentSession?.selected_affectations) {
+            affectationsList = JSON.parse(currentSession.selected_affectations)
+        }
+    } catch (_) { }
+
+    const affectationsStr = affectationsList.length > 0
+        ? affectationsList.join(', ')
+        : 'Ninguna'
+
+    const descStr = currentSession?.description && currentSession.description.trim().length > 0
+        ? currentSession.description.trim()
+        : 'No proporcionada'
+
+    const coordsStr = (currentSession?.latitude != null && currentSession?.longitude != null)
+        ? `${currentSession.latitude.toFixed(6)}, ${currentSession.longitude.toFixed(6)}`
+        : 'No registrada'
+
+    const summaryText = `📋 *Resumen de tu reporte*\n\n` +
+        `📍 *Ubicación:* ${coordsStr}\n` +
+        `📸 *Fotografía:* Recibida ✅\n` +
+        `⛈️ *Afectaciones:* ${affectationsStr}\n` +
+        `✍️ *Descripción:* ${descStr}`
+
+    if (mode === 'POLL') {
+        try {
+            await sock.sendMessage(sender, { text: summaryText })
+
+            const confirmPollMsg = await sock.sendMessage(sender, {
+                poll: {
+                    name: '👉 ¿Confirmás los datos para enviar el reporte?',
+                    values: ['1. Confirmar y enviar', '0. Cancelar'],
+                    selectableCount: 1
+                }
+            })
+
+            if (confirmPollMsg?.key?.id) {
+                const messageSecret = confirmPollMsg.message?.messageContextInfo?.messageSecret
+                if (messageSecret) {
+                    const encKeyHex = Buffer.isBuffer(messageSecret)
+                        ? messageSecret.toString('hex')
+                        : Buffer.from(messageSecret, 'base64').toString('hex')
+
+                    global.pollRegistry.set(confirmPollMsg.key.id, {
+                        type: 'CONFIRMATION',
+                        encKeyHex,
+                        userJid: sender
+                    })
+                }
+            }
+
+            addLog('message_out', `Resumen y encuesta interactiva de confirmación enviada a ${sender}`)
+            return confirmPollMsg
+        } catch (err) {
+            addLog('warn', `Fallo al enviar encuesta de confirmación (${err.message}). Utilizando texto alternativo.`)
+        }
+    }
+
+    // Modo TEXT o Fallback seguro
+    const classicSummary = summaryText + `\n\n¿Confirmás que los datos son correctos?\n\n` +
+        `👉 Respondé *1* o *CONFIRMAR* para enviar.\n` +
+        `👉 Respondé *0* o *CANCELAR* para salir.`
+
+    const sent = await sock.sendMessage(sender, { text: classicSummary })
+    addLog('message_out', `Resumen de reporte enviado para confirmación (modo texto clásico) a ${sender}`)
+    return sent
+}
+
+// Ejecución segura de confirmación de reporte y registro en cola local de sincronización
+async function executeReportConfirmation(sock, sender, session) {
+    const confirmedSession = db.prepare('SELECT latitude, longitude, selected_affectations, photo_path, description FROM report_sessions WHERE user_jid = ?').get(sender) || session
+
+    // Validar coordenadas obligatorias
+    if (confirmedSession.latitude == null || confirmedSession.longitude == null) {
+        const invalidCoordsMsg = `No se detectaron coordenadas válidas para este reporte. Escribí *REPORTAR* para iniciar un reporte nuevo.`
+        deleteSession(sender)
+        await sock.sendMessage(sender, { text: invalidCoordsMsg })
+        return true
+    }
+
+    const reportId = crypto.randomUUID()
+
+    // 1. Guardar primero en pending_sync_reports
+    try {
+        db.prepare(`
+            INSERT INTO pending_sync_reports (
+                id, user_jid, latitude, longitude, selected_affectations, photo_path, description, status, attempts, next_retry_at, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'PENDING', 0, 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+        `).run(
+            reportId,
+            sender,
+            confirmedSession.latitude,
+            confirmedSession.longitude,
+            confirmedSession.selected_affectations || '[]',
+            confirmedSession.photo_path || null,
+            confirmedSession.description || null
+        )
+    } catch (err) {
+        addLog('error', `Fallo al registrar reporte en pending_sync_reports para ${sender}: ${err.message}`)
+        const dbFailMsg = `⚠️ Ocurrió un error al registrar tu reporte localmente. Por favor respondé *1* para intentar confirmar nuevamente.`
+        await sock.sendMessage(sender, { text: dbFailMsg })
+        return true
+    }
+
+    // 2. Solo tras guardar exitosamente en SQLite, cerrar la sesión conversacional SIN borrar la foto
+    deleteSessionWithoutPhoto(sender)
+
+    // 3. Enviar confirmación al usuario
+    const finalMsg = `✅ *¡Reporte recibido correctamente!*\n\n¡Muchas gracias por tu colaboración! 🙌\n\nTu reporte contribuirá al monitoreo de inundaciones urbanas y a la identificación de zonas afectadas.\n\n🗺️ *¡Explorá nuestro mapa interactivo!*\n\nPodés visualizar los reportes de inundaciones en nuestra plataforma web:\n\n🔗 https://mapa-chi-steel.vercel.app/`
+    await sock.sendMessage(sender, { text: finalMsg })
+    addLog('message_out', `Reporte confirmado por ${sender} (ID pendiente: ${reportId}). Sesión cerrada.`)
+
+    // 4. Disparar sincronización asíncrona hacia Supabase (no bloquea al usuario)
+    triggerSyncPendingReports().catch(syncErr => {
+        addLog('error', `⚠️ Error al activar sincronización asíncrona: ${syncErr.message}`)
+    })
+
+    return true
 }
 
 // Envío de encuesta interactiva de WhatsApp para afectaciones y opciones de decisión
@@ -693,40 +819,12 @@ async function handleFloodReportFlow(sock, sender, msg) {
     // Helper para mostrar resumen antes de confirmar
     const sendReportSummary = async () => {
         const currentSession = db.prepare('SELECT latitude, longitude, selected_affectations, photo_path, description FROM report_sessions WHERE user_jid = ?').get(sender)
-
-        let affectationsList = []
-        try {
-            affectationsList = JSON.parse(currentSession?.selected_affectations || '[]')
-        } catch (_) { }
-
-        const affectationsStr = affectationsList.length > 0
-            ? affectationsList.join(', ')
-            : 'Ninguna'
-
-        const descStr = currentSession?.description && currentSession.description.trim().length > 0
-            ? currentSession.description.trim()
-            : 'No proporcionada'
-
-        const coordsStr = (currentSession?.latitude != null && currentSession?.longitude != null)
-            ? `${currentSession.latitude.toFixed(6)}, ${currentSession.longitude.toFixed(6)}`
-            : 'No registrada'
-
-        const summaryMsg = `📋 *Resumen de tu reporte*\n\n` +
-            `📍 *Ubicación:* ${coordsStr}\n` +
-            `📸 *Fotografía:* Recibida ✅\n` +
-            `⛈️ *Afectaciones:* ${affectationsStr}\n` +
-            `✍️ *Descripción:* ${descStr}\n\n` +
-            `¿Confirmás que los datos son correctos?\n\n` +
-            `👉 Respondé *1* o *CONFIRMAR* para enviar.\n` +
-            `👉 Respondé *0* o *CANCELAR* para salir.`
-
-        await sock.sendMessage(sender, { text: summaryMsg })
-        addLog('message_out', `Resumen de reporte enviado para confirmación a ${sender}`)
+        return await sendReportConfirmationInterface(sock, sender, currentSession)
     }
 
     // Procesamiento silencioso de votos en encuestas de WhatsApp
     if (rawMsg.pollUpdateMessage) {
-        if (session.state === 'AWAITING_AFFECTATIONS_AND_DESC' || session.state === 'AWAITING_DESCRIPTION') {
+        if (session.state === 'AWAITING_AFFECTATIONS_AND_DESC' || session.state === 'AWAITING_DESCRIPTION' || session.state === 'AWAITING_CONFIRMATION') {
             try {
                 const pollUpdate = rawMsg.pollUpdateMessage
                 const vote = pollUpdate.vote
@@ -846,7 +944,30 @@ async function handleFloodReportFlow(sock, sender, msg) {
                                 }
                             }
 
-                            // 2. Si el voto corresponde a la encuesta de afectaciones
+                            // 2. Si el voto corresponde a la encuesta interactiva de confirmación (Confirmar / Cancelar)
+                            if (pollType === 'CONFIRMATION') {
+                                const hashConfirm1 = crypto.createHash('sha256').update('1. Confirmar y enviar').digest('hex')
+                                const hashConfirm2 = crypto.createHash('sha256').update('Confirmar y enviar').digest('hex')
+                                const hashConfirm3 = crypto.createHash('sha256').update('1. Confirmar').digest('hex')
+                                const hashConfirm4 = crypto.createHash('sha256').update('Confirmar').digest('hex')
+                                const hashCancel1 = crypto.createHash('sha256').update('0. Cancelar').digest('hex')
+                                const hashCancel2 = crypto.createHash('sha256').update('Cancelar').digest('hex')
+
+                                if (selectedHashes.includes(hashConfirm1) || selectedHashes.includes(hashConfirm2) || selectedHashes.includes(hashConfirm3) || selectedHashes.includes(hashConfirm4)) {
+                                    addLog('info', `✅ Opción 'Confirmar y enviar' seleccionada en encuesta interactiva por ${sender}`)
+                                    return await executeReportConfirmation(sock, sender, session)
+                                }
+
+                                if (selectedHashes.includes(hashCancel1) || selectedHashes.includes(hashCancel2)) {
+                                    addLog('info', `❌ Opción 'Cancelar' seleccionada en encuesta interactiva por ${sender}`)
+                                    deleteSession(sender)
+                                    const cancelMsg = 'Reporte cancelado. Escribí *REPORTAR* cuando quieras comenzar de nuevo.'
+                                    await sock.sendMessage(sender, { text: cancelMsg })
+                                    return true
+                                }
+                            }
+
+                            // 3. Si el voto corresponde a la encuesta de afectaciones
                             const selectedCategories = []
                             AFFECTATION_CATEGORIES.forEach((cat, idx) => {
                                 const optionText = `${idx + 1}. ${cat}`
@@ -1073,54 +1194,7 @@ async function handleFloodReportFlow(sock, sender, msg) {
     // 6. Estado: AWAITING_CONFIRMATION (Confirmación final y envío a Supabase)
     if (session.state === 'AWAITING_CONFIRMATION') {
         if (text === '1' || lowerText === 'confirmar') {
-            const confirmedSession = db.prepare('SELECT latitude, longitude, selected_affectations, photo_path, description FROM report_sessions WHERE user_jid = ?').get(sender) || session
-
-            // Validar coordenadas obligatorias
-            if (confirmedSession.latitude == null || confirmedSession.longitude == null) {
-                const invalidCoordsMsg = `No se detectaron coordenadas válidas para este reporte. Escribí *REPORTAR* para iniciar un reporte nuevo.`
-                deleteSession(sender)
-                await sock.sendMessage(sender, { text: invalidCoordsMsg })
-                return true
-            }
-
-            const reportId = crypto.randomUUID()
-
-            // 1. Guardar primero en pending_sync_reports
-            try {
-                db.prepare(`
-                    INSERT INTO pending_sync_reports (
-                        id, user_jid, latitude, longitude, selected_affectations, photo_path, description, status, attempts, next_retry_at, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, 'PENDING', 0, 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-                `).run(
-                    reportId,
-                    sender,
-                    confirmedSession.latitude,
-                    confirmedSession.longitude,
-                    confirmedSession.selected_affectations || '[]',
-                    confirmedSession.photo_path || null,
-                    confirmedSession.description || null
-                )
-            } catch (err) {
-                addLog('error', `Fallo al registrar reporte en pending_sync_reports para ${sender}: ${err.message}`)
-                const dbFailMsg = `⚠️ Ocurrió un error al registrar tu reporte localmente. Por favor respondé *1* para intentar confirmar nuevamente.`
-                await sock.sendMessage(sender, { text: dbFailMsg })
-                return true
-            }
-
-            // 2. Solo tras guardar exitosamente en SQLite, cerrar la sesión conversacional SIN borrar la foto
-            deleteSessionWithoutPhoto(sender)
-
-            // 3. Enviar confirmación al usuario
-            const finalMsg = `✅ *¡Reporte recibido correctamente!*\n\n¡Muchas gracias por tu colaboración! 🙌\n\nTu reporte contribuirá al monitoreo de inundaciones urbanas y a la identificación de zonas afectadas.\n\n🗺️ *¡Explorá nuestro mapa interactivo!*\n\nPodés visualizar los reportes de inundaciones en nuestra plataforma web:\n\n🔗 https://mapa-chi-steel.vercel.app/`
-            await sock.sendMessage(sender, { text: finalMsg })
-            addLog('message_out', `Reporte confirmado por ${sender} (ID pendiente: ${reportId}). Sesión cerrada.`)
-
-            // 4. Disparar sincronización asíncrona hacia Supabase (no bloquea al usuario)
-            triggerSyncPendingReports().catch(syncErr => {
-                addLog('error', `⚠️ Error al activar sincronización asíncrona: ${syncErr.message}`)
-            })
-
-            return true
+            return await executeReportConfirmation(sock, sender, session)
         }
 
         if (text === '0' || lowerText === 'cancelar') {
@@ -1302,6 +1376,9 @@ if (process.env.NODE_ENV === 'test') {
         DB_PATH,
         DECISION_INTERFACE_MODE,
         sendContinueOrCancelInterface,
+        CONFIRMATION_INTERFACE_MODE,
+        sendReportConfirmationInterface,
+        executeReportConfirmation,
         EXPERIMENTAL_BUTTONS_ENABLED: false,
         sendContinueOrCancelButtons: sendContinueOrCancelInterface
     }

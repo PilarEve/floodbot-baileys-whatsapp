@@ -49,13 +49,16 @@ const {
     DB_PATH,
     DECISION_INTERFACE_MODE,
     sendContinueOrCancelInterface,
+    CONFIRMATION_INTERFACE_MODE,
+    sendReportConfirmationInterface,
+    executeReportConfirmation,
     EXPERIMENTAL_BUTTONS_ENABLED,
     sendContinueOrCancelButtons
 } = require('./bot')
 
 const { insertReportRecord } = require('./supabaseClient')
 
-console.log('🧪 Iniciando batería exhaustiva de pruebas (13 escenarios aislados)...\n')
+console.log('🧪 Iniciando batería exhaustiva de pruebas (14 escenarios aislados)...\n')
 console.log(`📁 Directorio de pruebas aislado: ${testDir}`)
 console.log(`🗄️ Base de datos temporal: ${testDbPath}`)
 console.log(`📸 Carpeta temporal de uploads: ${testUploads}\n`)
@@ -675,10 +678,181 @@ async function runTests() {
         passedTests++
 
         // --------------------------------------------------------------------------
+        // Test 14: Interfaz interactiva nativa de confirmación (Confirmar / Cancelar) y comandos de texto
+        // --------------------------------------------------------------------------
+        console.log('▶️ Test 14: Encuesta interactiva de confirmación final (Confirmar / Cancelar) y comandos de texto...')
+
+        const testUserConfirm = '595988880001@s.whatsapp.net'
+        const mockSessionData = {
+            latitude: -25.2865,
+            longitude: -57.6472,
+            selected_affectations: JSON.stringify(['Calle inundada', 'Vehículo afectado']),
+            description: 'Agua cubriendo veredas',
+            photo_path: path.join(testUploads, 'photo_test_14.jpg')
+        }
+        fs.writeFileSync(mockSessionData.photo_path, 'fake_jpg_content_14')
+
+        // 14a: Envío de resumen y encuesta interactiva nativa de confirmación (modo 'POLL')
+        const mockSockConfirmPoll = createMockSocket()
+        const sentConfirmMsg = await sendReportConfirmationInterface(mockSockConfirmPoll, testUserConfirm, mockSessionData)
+
+        assert.strictEqual(mockSockConfirmPoll.sentMessages.length, 2, 'Debe haber enviado 2 mensajes: resumen de texto y encuesta interactiva')
+        assert.ok(mockSockConfirmPoll.sentMessages[0].content.text.includes('Resumen de tu reporte'), 'Primer mensaje debe ser el resumen')
+        const confirmPollContent = mockSockConfirmPoll.sentMessages[1].content
+        assert.ok(confirmPollContent.poll, 'Segundo mensaje debe ser la encuesta interactiva nativa')
+        assert.strictEqual(confirmPollContent.poll.name, '👉 ¿Confirmás los datos para enviar el reporte?')
+        assert.deepStrictEqual(confirmPollContent.poll.values, ['1. Confirmar y enviar', '0. Cancelar'])
+        assert.strictEqual(confirmPollContent.poll.selectableCount, 1, 'Debe permitir seleccionar solo una opción')
+        assert.ok(global.pollRegistry.has(sentConfirmMsg.key.id), 'Debe registrar la encuesta de confirmación en global.pollRegistry')
+        assert.strictEqual(global.pollRegistry.get(sentConfirmMsg.key.id).type, 'CONFIRMATION')
+
+        // 14b: Modo tradicional de texto plano (reversibilidad rápida mediante modeOverride = 'TEXT')
+        const mockSockConfirmText = createMockSocket()
+        await sendReportConfirmationInterface(mockSockConfirmText, testUserConfirm, mockSessionData, 'TEXT')
+        assert.strictEqual(mockSockConfirmText.sentMessages.length, 1, 'En modo TEXT debe emitir un único mensaje')
+        assert.ok(mockSockConfirmText.sentMessages[0].content.text.includes('Respondé *1* o *CONFIRMAR*'), 'Debe incluir instrucciones tradicionales de texto')
+
+        // 14c: Respuesta seleccionando "1. Confirmar y enviar" en la encuesta interactiva
+        const userConfirmVote = '595988880002@s.whatsapp.net'
+        deleteSession(userConfirmVote)
+        const photoVotePath = path.join(testUploads, 'photo_vote_14c.jpg')
+        fs.writeFileSync(photoVotePath, 'vote_jpg_content')
+
+        db.prepare(`
+            INSERT INTO report_sessions (user_jid, state, latitude, longitude, selected_affectations, photo_path, description, updated_at)
+            VALUES (?, 'AWAITING_CONFIRMATION', -25.29, -57.65, '["Calle inundada"]', ?, 'Detalle de prueba', datetime('now'))
+        `).run(userConfirmVote, photoVotePath)
+
+        const mockSockVoteConfirm = createMockSocket()
+        const decMsgConfirm = await sendReportConfirmationInterface(mockSockVoteConfirm, userConfirmVote, {
+            latitude: -25.29,
+            longitude: -57.65,
+            selected_affectations: '["Calle inundada"]',
+            photo_path: photoVotePath,
+            description: 'Detalle de prueba'
+        }, 'POLL')
+
+        const voteEncConfirm = generateEncryptedPollVote({
+            pollMsgId: decMsgConfirm.key.id,
+            pollCreatorJid: mockSockVoteConfirm.user.id,
+            voterJid: userConfirmVote,
+            pollEncKey: Buffer.from(global.pollRegistry.get(decMsgConfirm.key.id).encKeyHex, 'hex'),
+            selectedOptionText: '1. Confirmar y enviar'
+        })
+
+        await handleFloodReportFlow(mockSockVoteConfirm, userConfirmVote, {
+            key: { remoteJid: userConfirmVote, id: 'MSG_VOTE_CONFIRM_1' },
+            message: {
+                pollUpdateMessage: {
+                    pollCreationMessageKey: {
+                        id: decMsgConfirm.key.id,
+                        remoteJid: userConfirmVote,
+                        fromMe: true
+                    },
+                    vote: voteEncConfirm
+                }
+            }
+        })
+
+        // Verificar que la sesión activa se cerró
+        const sessionAfterVoteConfirm = db.prepare('SELECT state FROM report_sessions WHERE user_jid = ?').get(userConfirmVote)
+        assert.strictEqual(sessionAfterVoteConfirm, undefined, 'La sesión activa debe cerrarse tras confirmar')
+
+        // Verificar que el reporte se guardó en pending_sync_reports
+        const pendingReport = db.prepare('SELECT id, status, photo_path FROM pending_sync_reports WHERE user_jid = ?').get(userConfirmVote)
+        assert.ok(pendingReport, 'El reporte confirmado debe residir en pending_sync_reports')
+        assert.strictEqual(pendingReport.status, 'PENDING')
+        assert.ok(fs.existsSync(pendingReport.photo_path), 'La fotografía local debe conservarse para la sincronización')
+
+        // Verificar mensaje de agradecimiento
+        const lastMsgConfirm = mockSockVoteConfirm.sentMessages[mockSockVoteConfirm.sentMessages.length - 1]
+        assert.ok(lastMsgConfirm.content.text.includes('¡Reporte recibido correctamente!'), 'Debe emitir mensaje final de confirmación')
+
+        // Limpiar registro pendiente de prueba
+        db.prepare('DELETE FROM pending_sync_reports WHERE id = ?').run(pendingReport.id)
+        safeDeleteUploadFile(photoVotePath)
+
+        // 14d: Respuesta seleccionando "0. Cancelar" en la encuesta interactiva
+        const userCancelVote = '595988880003@s.whatsapp.net'
+        deleteSession(userCancelVote)
+        const photoCancelPath = path.join(testUploads, 'photo_cancel_14d.jpg')
+        fs.writeFileSync(photoCancelPath, 'cancel_jpg_content')
+
+        db.prepare(`
+            INSERT INTO report_sessions (user_jid, state, latitude, longitude, selected_affectations, photo_path, description, updated_at)
+            VALUES (?, 'AWAITING_CONFIRMATION', -25.29, -57.65, '["Calle inundada"]', ?, 'Detalle', datetime('now'))
+        `).run(userCancelVote, photoCancelPath)
+
+        const mockSockVoteCancelConfirm = createMockSocket()
+        const decMsgCancelConfirm = await sendReportConfirmationInterface(mockSockVoteCancelConfirm, userCancelVote, {
+            latitude: -25.29,
+            longitude: -57.65,
+            photo_path: photoCancelPath
+        }, 'POLL')
+
+        const voteEncCancelConfirm = generateEncryptedPollVote({
+            pollMsgId: decMsgCancelConfirm.key.id,
+            pollCreatorJid: mockSockVoteCancelConfirm.user.id,
+            voterJid: userCancelVote,
+            pollEncKey: Buffer.from(global.pollRegistry.get(decMsgCancelConfirm.key.id).encKeyHex, 'hex'),
+            selectedOptionText: '0. Cancelar'
+        })
+
+        await handleFloodReportFlow(mockSockVoteCancelConfirm, userCancelVote, {
+            key: { remoteJid: userCancelVote, id: 'MSG_VOTE_CONFIRM_0' },
+            message: {
+                pollUpdateMessage: {
+                    pollCreationMessageKey: {
+                        id: decMsgCancelConfirm.key.id,
+                        remoteJid: userCancelVote,
+                        fromMe: true
+                    },
+                    vote: voteEncCancelConfirm
+                }
+            }
+        })
+
+        const sessionAfterVoteCancelConfirm = db.prepare('SELECT state FROM report_sessions WHERE user_jid = ?').get(userCancelVote)
+        assert.strictEqual(sessionAfterVoteCancelConfirm, undefined, 'Votar Cancelar debe eliminar la sesión activa')
+        assert.strictEqual(fs.existsSync(photoCancelPath), false, 'La foto temporal debe eliminarse al cancelar')
+        const lastMsgCancelConfirm = mockSockVoteCancelConfirm.sentMessages[mockSockVoteCancelConfirm.sentMessages.length - 1]
+        assert.ok(lastMsgCancelConfirm.content.text.includes('Reporte cancelado'), 'Debe enviar mensaje de confirmación de cancelación')
+
+        // 14e: Respaldo de comando escrito ('CONFIRMAR')
+        const userTextConfirm = '595988880004@s.whatsapp.net'
+        deleteSession(userTextConfirm)
+        const photoTextConfirm = path.join(testUploads, 'photo_text_14e.jpg')
+        fs.writeFileSync(photoTextConfirm, 'text_confirm_jpg')
+
+        db.prepare(`
+            INSERT INTO report_sessions (user_jid, state, latitude, longitude, selected_affectations, photo_path, description, updated_at)
+            VALUES (?, 'AWAITING_CONFIRMATION', -25.29, -57.65, '["Calle inundada"]', ?, 'Detalle', datetime('now'))
+        `).run(userTextConfirm, photoTextConfirm)
+
+        const mockSockTextConfirm = createMockSocket()
+        await handleFloodReportFlow(mockSockTextConfirm, userTextConfirm, {
+            key: { remoteJid: userTextConfirm, id: 'MSG_TEXT_CONFIRM' },
+            message: { conversation: 'CONFIRMAR' }
+        })
+
+        const sessionAfterTextConfirm = db.prepare('SELECT state FROM report_sessions WHERE user_jid = ?').get(userTextConfirm)
+        assert.strictEqual(sessionAfterTextConfirm, undefined, 'Comando escrito CONFIRMAR debe cerrar sesión')
+        const pendingFromText = db.prepare('SELECT id FROM pending_sync_reports WHERE user_jid = ?').get(userTextConfirm)
+        assert.ok(pendingFromText, 'Comando escrito CONFIRMAR debe registrar en pending_sync_reports')
+        db.prepare('DELETE FROM pending_sync_reports WHERE id = ?').run(pendingFromText.id)
+        safeDeleteUploadFile(photoTextConfirm)
+
+        safeDeleteUploadFile(mockSessionData.photo_path)
+        deleteSession(testUserConfirm)
+
+        console.log('  ✅ Test 14 aprobado: Encuesta nativa de confirmación (Confirmar / Cancelar) y comandos de texto alternativos 100% operativos.\n')
+        passedTests++
+
+        // --------------------------------------------------------------------------
         // Resumen
         // --------------------------------------------------------------------------
         console.log('==============================================================================')
-        console.log(`🎉 BATERÍA COMPLETA: ${passedTests} de 13 pruebas aprobadas exitosamente.`)
+        console.log(`🎉 BATERÍA COMPLETA: ${passedTests} de 14 pruebas aprobadas exitosamente.`)
         console.log('🛡️ Aislamiento verificado: sessions.db y uploads/ reales no sufrieron modificaciones.')
         console.log('==============================================================================\n')
     } finally {
