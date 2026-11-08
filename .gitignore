@@ -9,6 +9,7 @@ sessions.db
 sessions.db-journal
 *.db
 *.log
+*.bak
 
 # WhatsApp session data (sensitive!)
 auth_info_baileys/

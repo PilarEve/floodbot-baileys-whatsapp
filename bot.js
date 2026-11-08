@@ -31,10 +31,28 @@ const {
 
 const { syncReportToSupabase, isSupabaseConfigured } = require('./supabaseClient')
 
+// Silenciar avisos criptográficos internos de bajo nivel de libsignal (SessionEntry, buffers)
+const _originalConsoleInfo = console.info
+console.info = (...args) => {
+    const firstArg = typeof args[0] === 'string' ? args[0] : ''
+    if (
+        firstArg.includes('Closing session') ||
+        firstArg.includes('Opening session') ||
+        firstArg.includes('Removing old closed session') ||
+        firstArg.includes('Closing open session')
+    ) {
+        return
+    }
+    _originalConsoleInfo.apply(console, args)
+}
+
 // Directorios y persistencia local
 const AUTH_DIR = path.resolve(__dirname, 'auth_info_baileys')
 const UPLOADS_DIR = path.resolve(__dirname, 'uploads')
 const DB_PATH = path.resolve(__dirname, 'sessions.db')
+
+// Tiempo máximo de inactividad por usuario (30 minutos en milisegundos)
+const SESSION_TIMEOUT_MS = 30 * 60 * 1000
 
 if (!fs.existsSync(UPLOADS_DIR)) {
     fs.mkdirSync(UPLOADS_DIR, { recursive: true })
@@ -71,6 +89,119 @@ function addLog(type, message) {
     } catch (_) { }
     const time = new Date().toLocaleTimeString()
     console.log(`[${time}] [${type.toUpperCase()}] ${message}`)
+}
+
+// Helper para convertir el updated_at de SQLite a milisegundos UTC
+function parseSessionUtcTimestamp(updatedAt) {
+    if (!updatedAt) return 0
+    if (typeof updatedAt === 'number') {
+        return updatedAt < 10000000000 ? updatedAt * 1000 : updatedAt
+    }
+    if (typeof updatedAt === 'string') {
+        const trimmed = updatedAt.trim()
+        if (/^\d+$/.test(trimmed)) {
+            const num = parseInt(trimmed, 10)
+            return num < 10000000000 ? num * 1000 : num
+        }
+        // SQLite CURRENT_TIMESTAMP siempre genera "YYYY-MM-DD HH:MM:SS" en UTC
+        if (trimmed.includes(' ') && !trimmed.endsWith('Z')) {
+            return new Date(trimmed.replace(' ', 'T') + 'Z').getTime()
+        }
+        return new Date(trimmed).getTime()
+    }
+    return 0
+}
+
+// Verifica si una sesión ha superado los 30 minutos de inactividad
+function isSessionExpired(session) {
+    if (!session || !session.updated_at) return false
+    const lastActiveMs = parseSessionUtcTimestamp(session.updated_at)
+    if (!lastActiveMs || isNaN(lastActiveMs)) return false
+    return (Date.now() - lastActiveMs) >= SESSION_TIMEOUT_MS
+}
+
+// Eliminación segura de archivos temporales verificando pertenencia a uploads/ y sin interrumpir el bot
+function safeDeleteUploadFile(filePath) {
+    if (!filePath || typeof filePath !== 'string') return false
+    try {
+        const resolvedPath = path.resolve(filePath)
+        const resolvedUploads = path.resolve(UPLOADS_DIR)
+        // Seguridad: verificar que la ruta resuelta esté estrictamente dentro de uploads/
+        if (!resolvedPath.startsWith(resolvedUploads) || resolvedPath === resolvedUploads) {
+            addLog('warn', `Intento de eliminación fuera de uploads/ rechazado: ${resolvedPath}`)
+            return false
+        }
+        if (fs.existsSync(resolvedPath)) {
+            fs.unlinkSync(resolvedPath)
+            addLog('info', `🧹 Archivo temporal eliminado con seguridad: ${path.basename(resolvedPath)}`)
+            return true
+        }
+    } catch (err) {
+        // Envoltorio seguro: nunca lanzar excepción ni detener el flujo del bot
+        addLog('error', `Error controlado al intentar eliminar ${filePath}: ${err.message}`)
+    }
+    return false
+}
+
+// Elimina la sesión en SQLite y su foto temporal asociada (si existe) de forma segura
+function deleteSession(userJid) {
+    try {
+        const current = db.prepare('SELECT photo_path FROM report_sessions WHERE user_jid = ?').get(userJid)
+        if (current?.photo_path) {
+            safeDeleteUploadFile(current.photo_path)
+        }
+        db.prepare('DELETE FROM report_sessions WHERE user_jid = ?').run(userJid)
+    } catch (err) {
+        addLog('error', `Error al eliminar sesión de ${userJid}: ${err.message}`)
+    }
+}
+
+// Limpieza periódica y al inicio: elimina sesiones expiradas (>30 min) y fotos huérfanas en uploads/
+function cleanupExpiredSessionsAndFiles() {
+    try {
+        const allSessions = db.prepare('SELECT user_jid, photo_path, updated_at FROM report_sessions').all()
+        const activePhotoPaths = new Set()
+        let expiredCount = 0
+
+        for (const s of allSessions) {
+            if (isSessionExpired(s)) {
+                if (s.photo_path) {
+                    safeDeleteUploadFile(s.photo_path)
+                }
+                db.prepare('DELETE FROM report_sessions WHERE user_jid = ?').run(s.user_jid)
+                expiredCount++
+            } else if (s.photo_path) {
+                // Sesión activa: registrar su fotografía para que NUNCA sea eliminada
+                activePhotoPaths.add(path.resolve(s.photo_path))
+            }
+        }
+
+        if (expiredCount > 0) {
+            addLog('info', `🧹 Limpieza: ${expiredCount} sesión(es) expirada(s) eliminada(s) por inactividad.`)
+        }
+
+        // Inspeccionar archivos en uploads/
+        if (fs.existsSync(UPLOADS_DIR)) {
+            const files = fs.readdirSync(UPLOADS_DIR)
+            const now = Date.now()
+
+            for (const file of files) {
+                const fullPath = path.resolve(UPLOADS_DIR, file)
+                // CONDICIÓN ESTRICTA: Solo eliminar si NO pertenece a una sesión activa
+                if (!activePhotoPaths.has(fullPath)) {
+                    try {
+                        const stat = fs.statSync(fullPath)
+                        // Si está huérfana y tiene más de 30 minutos de antigüedad (margen de seguridad)
+                        if (now - stat.mtimeMs >= SESSION_TIMEOUT_MS) {
+                            safeDeleteUploadFile(fullPath)
+                        }
+                    } catch (_) {}
+                }
+            }
+        }
+    } catch (err) {
+        addLog('error', `Error en mantenimiento de sesiones y archivos temporales: ${err.message}`)
+    }
 }
 
 // Categorías oficiales de afectación de la plataforma de monitoreo
@@ -169,19 +300,10 @@ async function handleFloodReportFlow(sock, sender, msg) {
     const text = messageContent.trim()
     const lowerText = text.toLowerCase()
 
-    // 1. Cancelación global en cualquier momento
-    if (lowerText === 'cancelar' || text === '0' && !db.prepare('SELECT state FROM report_sessions WHERE user_jid = ?').get(sender)) {
-        db.prepare('DELETE FROM report_sessions WHERE user_jid = ?').run(sender)
-        const cancelMsg = 'Reporte cancelado. Escribí *REPORTAR* cuando quieras comenzar de nuevo.'
-        await sock.sendMessage(sender, { text: cancelMsg })
-        addLog('message_out', `Flujo cancelado por usuario: ${sender}`)
-        return true
-    }
-
     // Debounce para evitar ráfagas repetidas
     if (!global.recentTriggers) global.recentTriggers = new Map()
 
-    const session = db.prepare('SELECT state, latitude, longitude, selected_affectations, photo_path, description, poll_msg_id, poll_enc_key FROM report_sessions WHERE user_jid = ?').get(sender)
+    const session = db.prepare('SELECT state, latitude, longitude, selected_affectations, photo_path, description, poll_msg_id, poll_enc_key, updated_at FROM report_sessions WHERE user_jid = ?').get(sender)
 
     // Helper para iniciar un reporte nuevo
     const startNewReport = async () => {
@@ -189,6 +311,12 @@ async function handleFloodReportFlow(sock, sender, msg) {
         const now = Date.now()
         if (now - lastTrigger < 3000) return true
         global.recentTriggers.set(sender, now)
+
+        // Limpieza de foto temporal anterior si existía en una sesión previa no confirmada
+        const prevSession = db.prepare('SELECT photo_path FROM report_sessions WHERE user_jid = ?').get(sender)
+        if (prevSession?.photo_path) {
+            safeDeleteUploadFile(prevSession.photo_path)
+        }
 
         db.prepare(`
             INSERT INTO report_sessions (user_jid, state, selected_affectations, updated_at)
@@ -200,7 +328,6 @@ async function handleFloodReportFlow(sock, sender, msg) {
                 selected_affectations = '[]',
                 photo_path = NULL,
                 description = NULL,
-                
                 poll_msg_id = NULL,
                 poll_enc_key = NULL,
                 updated_at = CURRENT_TIMESTAMP
@@ -216,6 +343,28 @@ async function handleFloodReportFlow(sock, sender, msg) {
         return true
     }
 
+    // Comandos de reinicio manual (Inicio / Reiniciar / Empezar)
+    const isRestartCommand = lowerText === 'inicio' || lowerText === 'reiniciar' || lowerText === 'empezar'
+
+    // Comandos de cancelación manual (Cancelar / 0)
+    const isCancelCommand = lowerText === 'cancelar' || text === '0'
+
+    // 1. Cancelación global en cualquier momento
+    if (isCancelCommand) {
+        deleteSession(sender)
+        const cancelMsg = 'Reporte cancelado. Escribí *REPORTAR* cuando quieras comenzar de nuevo.'
+        await sock.sendMessage(sender, { text: cancelMsg })
+        addLog('message_out', `Flujo cancelado por usuario: ${sender}`)
+        return true
+    }
+
+    // 2. Reinicio manual en cualquier momento
+    if (isRestartCommand) {
+        deleteSession(sender)
+        addLog('info', `Reinicio solicitado por usuario (${text}) para ${sender}`)
+        return await startNewReport()
+    }
+
     // Iniciar con comando explícito
     if (lowerText === 'reportar' || lowerText.includes('inundacion') || lowerText.includes('inundación')) {
         return await startNewReport()
@@ -223,6 +372,15 @@ async function handleFloodReportFlow(sock, sender, msg) {
 
     // Si no hay sesión previa, iniciar con el primer mensaje
     if (!session) {
+        return await startNewReport()
+    }
+
+    // 3. Expiración por inactividad de 30 minutos:
+    // Si pasaron 30 min o más desde la última interacción en UTC, se descarta silenciosamente
+    // la sesión previa (sin mensajes automáticos de expiración) y se reinicia desde la bienvenida.
+    if (isSessionExpired(session)) {
+        addLog('info', `Sesión expirada por inactividad (>30 min) para ${sender}. Reiniciando flujo.`)
+        deleteSession(sender)
         return await startNewReport()
     }
 
@@ -389,6 +547,7 @@ async function handleFloodReportFlow(sock, sender, msg) {
         }
 
         const helpMsg = `Para continuar, compartí la ubicación del lugar afectado.`
+        db.prepare('UPDATE report_sessions SET updated_at = CURRENT_TIMESTAMP WHERE user_jid = ?').run(sender)
         await sock.sendMessage(sender, { text: helpMsg })
         return true
     }
@@ -432,6 +591,7 @@ async function handleFloodReportFlow(sock, sender, msg) {
         }
 
         const helpMsg = `Necesitamos una fotografía del lugar para continuar.`
+        db.prepare('UPDATE report_sessions SET updated_at = CURRENT_TIMESTAMP WHERE user_jid = ?').run(sender)
         await sock.sendMessage(sender, { text: helpMsg })
         return true
     }
@@ -439,7 +599,7 @@ async function handleFloodReportFlow(sock, sender, msg) {
     // 4. Estado: AWAITING_AFFECTATIONS_AND_DESC (Afectaciones y descripción opcional)
     if (session.state === 'AWAITING_AFFECTATIONS_AND_DESC') {
         if (text === '0' || lowerText === 'cancelar') {
-            db.prepare('DELETE FROM report_sessions WHERE user_jid = ?').run(sender)
+            deleteSession(sender)
             const cancelMsg = 'Reporte cancelado. Escribí *REPORTAR* cuando quieras comenzar de nuevo.'
             await sock.sendMessage(sender, { text: cancelMsg })
             return true
@@ -511,6 +671,7 @@ async function handleFloodReportFlow(sock, sender, msg) {
         }
 
         const helpStep = `👉 Respondé *1* o *LISTO* para continuar.\n👉 Respondé *0* o *CANCELAR* para salir.`
+        db.prepare('UPDATE report_sessions SET updated_at = CURRENT_TIMESTAMP WHERE user_jid = ?').run(sender)
         await sock.sendMessage(sender, { text: helpStep })
         return true
     }
@@ -518,7 +679,7 @@ async function handleFloodReportFlow(sock, sender, msg) {
     // 5. Estado: AWAITING_DESCRIPTION (Descripción opcional del incidente)
     if (session.state === 'AWAITING_DESCRIPTION') {
         if (text === '0' || lowerText === 'cancelar') {
-            db.prepare('DELETE FROM report_sessions WHERE user_jid = ?').run(sender)
+            deleteSession(sender)
             const cancelMsg = 'Reporte cancelado. Escribí *REPORTAR* cuando quieras comenzar de nuevo.'
             await sock.sendMessage(sender, { text: cancelMsg })
             return true
@@ -552,6 +713,7 @@ async function handleFloodReportFlow(sock, sender, msg) {
         }
 
         const helpDesc = `✍️ *Descripción del incidente (opcional)*\n\n¿Querés agregar algún detalle sobre lo ocurrido?\n\n👉 Escribí tu descripción o respondé *1* para omitir.`
+        db.prepare('UPDATE report_sessions SET updated_at = CURRENT_TIMESTAMP WHERE user_jid = ?').run(sender)
         await sock.sendMessage(sender, { text: helpDesc })
         return true
     }
@@ -573,11 +735,8 @@ async function handleFloodReportFlow(sock, sender, msg) {
                         // Solo eliminar la foto local si AMBOS fueron exitosos: subida a Storage (publicUrl) Y registro en DB (success)
                         if (syncRes.success && syncRes.publicUrl) {
                             addLog('info', `☁️ Reporte y fotografía sincronizados en Supabase (ID: ${syncRes.report?.id || 'OK'})`)
-                            if (confirmedSession.photo_path && fs.existsSync(confirmedSession.photo_path)) {
-                                try {
-                                    fs.unlinkSync(confirmedSession.photo_path)
-                                    addLog('info', `🧹 Foto local temporal eliminada tras confirmar Storage y DB`)
-                                } catch (_) { }
+                            if (confirmedSession.photo_path) {
+                                safeDeleteUploadFile(confirmedSession.photo_path)
                             }
                         } else if (syncRes.success && !syncRes.publicUrl) {
                             addLog('warn', `⚠️ Reporte guardado en DB pero la foto no se pudo subir a Storage. Se conserva foto local: ${confirmedSession.photo_path}`)
@@ -596,13 +755,14 @@ async function handleFloodReportFlow(sock, sender, msg) {
         }
 
         if (text === '0' || lowerText === 'cancelar') {
-            db.prepare('DELETE FROM report_sessions WHERE user_jid = ?').run(sender)
+            deleteSession(sender)
             const cancelMsg = 'Reporte cancelado. Escribí *REPORTAR* cuando quieras comenzar de nuevo.'
             await sock.sendMessage(sender, { text: cancelMsg })
             return true
         }
 
         const reConfirmMsg = `Para finalizar, respondé *1* o *CONFIRMAR* para enviar el reporte, o *0* o *CANCELAR* para descartarlo.`
+        db.prepare('UPDATE report_sessions SET updated_at = CURRENT_TIMESTAMP WHERE user_jid = ?').run(sender)
         await sock.sendMessage(sender, { text: reConfirmMsg })
         return true
     }
@@ -613,6 +773,14 @@ async function handleFloodReportFlow(sock, sender, msg) {
 // Conexión principal con Baileys
 async function connectToWhatsApp() {
     console.log('🔄 Iniciando FloodBot con Baileys...')
+
+    // Mantenimiento de arranque: purga silenciosa de sesiones expiradas y archivos huérfanos
+    cleanupExpiredSessionsAndFiles()
+
+    // Programar limpieza periódica cada 15 minutos en segundo plano (sin mensajes a usuarios)
+    if (!global.cleanupInterval) {
+        global.cleanupInterval = setInterval(cleanupExpiredSessionsAndFiles, 15 * 60 * 1000)
+    }
 
     const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR)
 
@@ -689,13 +857,37 @@ async function connectToWhatsApp() {
     sock.ev.on('creds.update', saveCreds)
 
     // Manejador de mensajes entrantes
-    sock.ev.on('messages.upsert', async ({ messages }) => {
+    sock.ev.on('messages.upsert', async ({ messages, type }) => {
+        // Ignorar eventos que no sean notificaciones de mensajes entrantes en vivo
+        if (type !== 'notify') return
+
+        const nowSec = Math.floor(Date.now() / 1000)
+
         for (const msg of messages) {
             if (!msg.message || msg.key.fromMe) continue
 
             const sender = msg.key.remoteJid
             // Solo procesar mensajes de usuarios individuales (ignorar grupos y broadcast)
             if (sender.endsWith('@g.us') || sender.endsWith('@broadcast')) continue
+
+            // Protección contra mensajes antiguos encolados o duplicados durante reconexión
+            // Si el mensaje tiene más de 5 minutos de antigüedad respecto a la hora actual, se descarta
+            const msgTimestamp = Number(msg.messageTimestamp || 0)
+            if (msgTimestamp > 0 && (nowSec - msgTimestamp) > 300) {
+                continue
+            }
+
+            // Deduplicación por ID de mensaje para evitar procesar dos veces el mismo mensaje
+            if (!global.processedMsgIds) global.processedMsgIds = new Set()
+            const msgId = msg.key?.id
+            if (msgId) {
+                if (global.processedMsgIds.has(msgId)) continue
+                global.processedMsgIds.add(msgId)
+                if (global.processedMsgIds.size > 500) {
+                    const firstItem = global.processedMsgIds.values().next().value
+                    global.processedMsgIds.delete(firstItem)
+                }
+            }
 
             await handleFloodReportFlow(sock, sender, msg)
         }
@@ -704,7 +896,25 @@ async function connectToWhatsApp() {
     return sock
 }
 
-// Iniciar bot
-connectToWhatsApp().catch(err => {
-    console.error('❌ Error crítico al arrancar FloodBot:', err)
-})
+// Exportación para suite de pruebas
+if (process.env.NODE_ENV === 'test') {
+    module.exports = {
+        db,
+        SESSION_TIMEOUT_MS,
+        parseSessionUtcTimestamp,
+        isSessionExpired,
+        safeDeleteUploadFile,
+        deleteSession,
+        cleanupExpiredSessionsAndFiles,
+        handleFloodReportFlow,
+        AFFECTATION_CATEGORIES,
+        UPLOADS_DIR
+    }
+}
+
+// Iniciar bot solo en ejecución directa y fuera de pruebas
+if (require.main === module && process.env.NODE_ENV !== 'test') {
+    connectToWhatsApp().catch(err => {
+        console.error('❌ Error crítico al arrancar FloodBot:', err)
+    })
+}
