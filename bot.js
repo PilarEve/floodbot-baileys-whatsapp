@@ -26,7 +26,9 @@ const {
     decryptPollVote,
     getContentType,
     jidNormalizedUser,
-    getKeyAuthor
+    getKeyAuthor,
+    proto,
+    generateWAMessageFromContent
 } = require('@whiskeysockets/baileys')
 
 const {
@@ -473,6 +475,72 @@ function askQuestion(query) {
     }))
 }
 
+// ==============================================================================
+// CONFIGURACIÓN EXPERIMENTAL DE BOTONES INTERACTIVOS (BAILEYS)
+// ==============================================================================
+// Control de reversibilidad rápida (Condición 10):
+// - true: envía interfaz interactiva con botones seleccionables ('Continuar' y 'Cancelar').
+// - false: revierte inmediatamente al mensaje de texto plano tradicional.
+const EXPERIMENTAL_BUTTONS_ENABLED = true
+
+// Envío experimental de opciones interactivas (Continuar / Cancelar)
+async function sendContinueOrCancelButtons(sock, sender) {
+    if (!EXPERIMENTAL_BUTTONS_ENABLED) {
+        const classicText = `👉 Respondé *1* o *LISTO* para continuar.\n👉 Respondé *0* o *CANCELAR* para salir.`
+        await sock.sendMessage(sender, { text: classicText })
+        addLog('message_out', `Instrucciones clásicas de texto enviadas a ${sender}`)
+        return
+    }
+
+    try {
+        if (typeof sock.relayMessage === 'function') {
+            const buttonMessage = generateWAMessageFromContent(sender, {
+                viewOnceMessage: {
+                    message: {
+                        interactiveMessage: proto.Message.InteractiveMessage.create({
+                            body: proto.Message.InteractiveMessage.Body.create({
+                                text: `👉 Seleccioná una opción para continuar:\n\n_(También podés responder escribiendo *1* o *LISTO* para continuar, *0* o *CANCELAR* para salir)_`
+                            }),
+                            footer: proto.Message.InteractiveMessage.Footer.create({
+                                text: `Sistema de Monitoreo de Inundaciones`
+                            }),
+                            nativeFlowMessage: proto.Message.InteractiveMessage.NativeFlowMessage.create({
+                                buttons: [
+                                    {
+                                        name: 'quick_reply',
+                                        buttonParamsJson: JSON.stringify({
+                                            display_text: 'Continuar',
+                                            id: '1'
+                                        })
+                                    },
+                                    {
+                                        name: 'quick_reply',
+                                        buttonParamsJson: JSON.stringify({
+                                            display_text: 'Cancelar',
+                                            id: '0'
+                                        })
+                                    }
+                                ]
+                            })
+                        })
+                    }
+                }
+            }, {})
+
+            await sock.relayMessage(sender, buttonMessage.message, { messageId: buttonMessage.key.id })
+            addLog('message_out', `Botones interactivos (Continuar / Cancelar) enviados a ${sender}`)
+            return
+        }
+    } catch (err) {
+        addLog('warn', `No se pudieron enviar los botones interactivos (${err.message}). Utilizando texto alternativo.`)
+    }
+
+    // Fallback de seguridad si relayMessage no está disponible o la plataforma falla
+    const fallbackText = `👉 Respondé *1* o *LISTO* para continuar.\n👉 Respondé *0* o *CANCELAR* para salir.`
+    await sock.sendMessage(sender, { text: fallbackText })
+    addLog('message_out', `Instrucciones de texto (fallback) enviadas a ${sender}`)
+}
+
 // Envío de encuesta interactiva de WhatsApp para afectaciones
 async function sendAffectationPoll(sock, sender) {
     let pollMsgId = null
@@ -509,10 +577,7 @@ async function sendAffectationPoll(sock, sender) {
         `).run(pollMsgId, pollEncKeyHex, sender)
     }
 
-    const pollInstruction = `👉 Respondé *1* o *LISTO* para continuar.\n👉 Respondé *0* o *CANCELAR* para salir.`
-
-    await sock.sendMessage(sender, { text: pollInstruction })
-    addLog('message_out', `Encuesta e instrucciones enviadas a ${sender}`)
+    await sendContinueOrCancelButtons(sock, sender)
 }
 
 // Control del flujo conversacional para el reporte de inundaciones
@@ -527,6 +592,21 @@ async function handleFloodReportFlow(sock, sender, msg) {
         messageContent = rawMsg.extendedTextMessage.text
     } else if (rawMsg.imageMessage?.caption) {
         messageContent = rawMsg.imageMessage.caption
+    } else if (rawMsg.buttonsResponseMessage) {
+        // Respuesta a botones clásicos
+        messageContent = rawMsg.buttonsResponseMessage.selectedButtonId || rawMsg.buttonsResponseMessage.selectedDisplayText || ''
+    } else if (rawMsg.templateButtonReplyMessage) {
+        // Respuesta a template buttons
+        messageContent = rawMsg.templateButtonReplyMessage.selectedId || rawMsg.templateButtonReplyMessage.selectedDisplayText || ''
+    } else if (rawMsg.interactiveResponseMessage) {
+        // Respuesta a Native Flow Buttons interactivos
+        try {
+            const paramsJson = rawMsg.interactiveResponseMessage.nativeFlowResponseMessage?.paramsJson
+            if (paramsJson) {
+                const parsed = JSON.parse(paramsJson)
+                messageContent = parsed.id || parsed.display_text || ''
+            }
+        } catch (_) {}
     }
 
     const text = messageContent.trim()
@@ -1179,7 +1259,9 @@ if (process.env.NODE_ENV === 'test') {
         handleFloodReportFlow,
         AFFECTATION_CATEGORIES,
         UPLOADS_DIR,
-        DB_PATH
+        DB_PATH,
+        EXPERIMENTAL_BUTTONS_ENABLED,
+        sendContinueOrCancelButtons
     }
 }
 

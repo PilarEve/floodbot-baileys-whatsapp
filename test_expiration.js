@@ -44,12 +44,14 @@ const {
     triggerSyncPendingReports,
     handleFloodReportFlow,
     UPLOADS_DIR,
-    DB_PATH
+    DB_PATH,
+    EXPERIMENTAL_BUTTONS_ENABLED,
+    sendContinueOrCancelButtons
 } = require('./bot')
 
 const { insertReportRecord } = require('./supabaseClient')
 
-console.log('🧪 Iniciando batería exhaustiva de pruebas (12 escenarios aislados)...\n')
+console.log('🧪 Iniciando batería exhaustiva de pruebas (13 escenarios aislados)...\n')
 console.log(`📁 Directorio de pruebas aislado: ${testDir}`)
 console.log(`🗄️ Base de datos temporal: ${testDbPath}`)
 console.log(`📸 Carpeta temporal de uploads: ${testUploads}\n`)
@@ -62,6 +64,10 @@ function createMockSocket() {
         sendMessage: async (jid, content) => {
             sentMessages.push({ jid, content })
             return { key: { id: 'MOCK_MSG_' + Date.now() } }
+        },
+        relayMessage: async (jid, message, options) => {
+            sentMessages.push({ jid, content: { relayMessage: message, options } })
+            return { key: { id: options?.messageId || 'MOCK_RELAY_' + Date.now() } }
         },
         user: { id: '595981111111:0@s.whatsapp.net', lid: '123456789@lid' }
     }
@@ -486,10 +492,100 @@ async function runTests() {
         passedTests++
 
         // --------------------------------------------------------------------------
+        // Test 13: Interfaz experimental de botones interactivos y compatibilidad dual
+        // --------------------------------------------------------------------------
+        console.log('▶️ Test 13: Botones interactivos (Continuar / Cancelar) y comandos de texto alternativos...')
+
+        // 13a: Envío de botones interactivos a través de sendContinueOrCancelButtons
+        const testUserButtons = '595987778888@s.whatsapp.net'
+        const mockSockBtn = createMockSocket()
+        await sendContinueOrCancelButtons(mockSockBtn, testUserButtons)
+
+        assert.ok(mockSockBtn.sentMessages.length > 0, 'Debe haber enviado un mensaje')
+        const sentContent = mockSockBtn.sentMessages[0].content
+        const relayMsg = sentContent.relayMessage
+        assert.ok(relayMsg?.viewOnceMessage?.message?.interactiveMessage, 'Debe enviar un interactiveMessage')
+        const buttons = relayMsg.viewOnceMessage.message.interactiveMessage.nativeFlowMessage.buttons
+        assert.strictEqual(buttons.length, 2, 'Debe contener exactamente 2 botones')
+        assert.ok(buttons[0].buttonParamsJson.includes('Continuar'), 'Primer botón debe ser Continuar')
+        assert.ok(buttons[1].buttonParamsJson.includes('Cancelar'), 'Segundo botón debe ser Cancelar')
+
+        // 13b: Respuesta al presionar botón 'Continuar' (id: '1')
+        const userBtnContinue = '595989991111@s.whatsapp.net'
+        deleteSession(userBtnContinue)
+        db.prepare(`
+            INSERT INTO report_sessions (user_jid, state, updated_at)
+            VALUES (?, 'AWAITING_AFFECTATIONS_AND_DESC', datetime('now'))
+        `).run(userBtnContinue)
+
+        const mockSockBtnContinue = createMockSocket()
+        await handleFloodReportFlow(mockSockBtnContinue, userBtnContinue, {
+            key: { remoteJid: userBtnContinue, id: 'MSG_BTN_1' },
+            message: {
+                interactiveResponseMessage: {
+                    nativeFlowResponseMessage: {
+                        paramsJson: JSON.stringify({ id: '1', display_text: 'Continuar' })
+                    }
+                }
+            }
+        })
+
+        const sessionAfterContinue = db.prepare('SELECT state FROM report_sessions WHERE user_jid = ?').get(userBtnContinue)
+        assert.strictEqual(sessionAfterContinue?.state, 'AWAITING_DESCRIPTION', 'Presionar Continuar debe avanzar a AWAITING_DESCRIPTION')
+        assert.ok(mockSockBtnContinue.sentMessages[0].content.text.includes('Descripción'), 'Debe solicitar descripción')
+
+        // 13c: Respuesta al presionar botón 'Cancelar' (id: '0')
+        const userBtnCancel = '595989992222@s.whatsapp.net'
+        deleteSession(userBtnCancel)
+        db.prepare(`
+            INSERT INTO report_sessions (user_jid, state, updated_at)
+            VALUES (?, 'AWAITING_AFFECTATIONS_AND_DESC', datetime('now'))
+        `).run(userBtnCancel)
+
+        const mockSockBtnCancel = createMockSocket()
+        await handleFloodReportFlow(mockSockBtnCancel, userBtnCancel, {
+            key: { remoteJid: userBtnCancel, id: 'MSG_BTN_0' },
+            message: {
+                interactiveResponseMessage: {
+                    nativeFlowResponseMessage: {
+                        paramsJson: JSON.stringify({ id: '0', display_text: 'Cancelar' })
+                    }
+                }
+            }
+        })
+
+        const sessionAfterCancel = db.prepare('SELECT state FROM report_sessions WHERE user_jid = ?').get(userBtnCancel)
+        assert.strictEqual(sessionAfterCancel, undefined, 'Presionar Cancelar debe eliminar la sesión')
+        assert.ok(mockSockBtnCancel.sentMessages[0].content.text.includes('Reporte cancelado'), 'Debe enviar mensaje de cancelación')
+
+        // 13d: Conservación de comandos de texto escritos como alternativa (1 / 0)
+        const userTextFallback = '595989993333@s.whatsapp.net'
+        deleteSession(userTextFallback)
+        db.prepare(`
+            INSERT INTO report_sessions (user_jid, state, updated_at)
+            VALUES (?, 'AWAITING_AFFECTATIONS_AND_DESC', datetime('now'))
+        `).run(userTextFallback)
+
+        const mockSockTextFallback = createMockSocket()
+        await handleFloodReportFlow(mockSockTextFallback, userTextFallback, {
+            key: { remoteJid: userTextFallback, id: 'MSG_TEXT_1' },
+            message: { conversation: 'LISTO' }
+        })
+
+        const sessionAfterText = db.prepare('SELECT state FROM report_sessions WHERE user_jid = ?').get(userTextFallback)
+        assert.strictEqual(sessionAfterText?.state, 'AWAITING_DESCRIPTION', 'Comando escrito LISTO debe funcionar exactamente igual')
+
+        deleteSession(userBtnContinue)
+        deleteSession(userTextFallback)
+
+        console.log('  ✅ Test 13 aprobado: Botones interactivos y comandos de texto alternativos 100% operativos.\n')
+        passedTests++
+
+        // --------------------------------------------------------------------------
         // Resumen
         // --------------------------------------------------------------------------
         console.log('==============================================================================')
-        console.log(`🎉 BATERÍA COMPLETA: ${passedTests} de 12 pruebas aprobadas exitosamente.`)
+        console.log(`🎉 BATERÍA COMPLETA: ${passedTests} de 13 pruebas aprobadas exitosamente.`)
         console.log('🛡️ Aislamiento verificado: sessions.db y uploads/ reales no sufrieron modificaciones.')
         console.log('==============================================================================\n')
     } finally {
