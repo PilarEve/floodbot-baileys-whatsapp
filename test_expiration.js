@@ -496,10 +496,10 @@ async function runTests() {
         // --------------------------------------------------------------------------
         console.log('▶️ Test 13: Botones interactivos (Continuar / Cancelar) y comandos de texto alternativos...')
 
-        // 13a: Envío de botones interactivos a través de sendContinueOrCancelButtons
+        // 13a: Envío de botones interactivos a través de sendContinueOrCancelButtons (modo forzado para pruebas)
         const testUserButtons = '595987778888@s.whatsapp.net'
         const mockSockBtn = createMockSocket()
-        await sendContinueOrCancelButtons(mockSockBtn, testUserButtons)
+        await sendContinueOrCancelButtons(mockSockBtn, testUserButtons, true)
 
         assert.ok(mockSockBtn.sentMessages.length > 0, 'Debe haber enviado un mensaje')
         const sentContent = mockSockBtn.sentMessages[0].content
@@ -509,6 +509,11 @@ async function runTests() {
         assert.strictEqual(buttons.length, 2, 'Debe contener exactamente 2 botones')
         assert.ok(buttons[0].buttonParamsJson.includes('Continuar'), 'Primer botón debe ser Continuar')
         assert.ok(buttons[1].buttonParamsJson.includes('Cancelar'), 'Segundo botón debe ser Cancelar')
+
+        // 13a-bis: Verificación del modo seguro/clásico por defecto
+        const mockSockClassic = createMockSocket()
+        await sendContinueOrCancelButtons(mockSockClassic, testUserButtons, false)
+        assert.ok(mockSockClassic.sentMessages[0].content.text.includes('Respondé *1* o *LISTO*'), 'Por defecto debe emitir texto clásico seguro')
 
         // 13b: Respuesta al presionar botón 'Continuar' (id: '1')
         const userBtnContinue = '595989991111@s.whatsapp.net'

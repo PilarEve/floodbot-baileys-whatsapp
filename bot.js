@@ -481,11 +481,11 @@ function askQuestion(query) {
 // Control de reversibilidad rápida (Condición 10):
 // - true: envía interfaz interactiva con botones seleccionables ('Continuar' y 'Cancelar').
 // - false: revierte inmediatamente al mensaje de texto plano tradicional.
-const EXPERIMENTAL_BUTTONS_ENABLED = true
+const EXPERIMENTAL_BUTTONS_ENABLED = false
 
-// Envío experimental de opciones interactivas (Continuar / Cancelar)
-async function sendContinueOrCancelButtons(sock, sender) {
-    if (!EXPERIMENTAL_BUTTONS_ENABLED) {
+// Envío de opciones interactivas o texto clásico (Continuar / Cancelar)
+async function sendContinueOrCancelButtons(sock, sender, forceButtons = false) {
+    if (!EXPERIMENTAL_BUTTONS_ENABLED && !forceButtons) {
         const classicText = `👉 Respondé *1* o *LISTO* para continuar.\n👉 Respondé *0* o *CANCELAR* para salir.`
         await sock.sendMessage(sender, { text: classicText })
         addLog('message_out', `Instrucciones clásicas de texto enviadas a ${sender}`)
