@@ -36,6 +36,8 @@ Thumbs.db
 
 # Documentation (local only)
 docs/
+AUDITORIA_PRE_DESPLIEGUE.md
+simulacion_local.js
 
 # IDE
 .vscode/
