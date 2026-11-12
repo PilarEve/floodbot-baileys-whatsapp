@@ -37,6 +37,15 @@ const {
     syncReportToSupabase,
     isSupabaseConfigured
 } = require('./supabaseClient')
+const { defaultQueue, OUTGOING_RATE_LIMIT_MS } = require('./messageQueue')
+
+// Función centralizada para enviar mensajes salientes a través de la cola con Rate Limiting
+function sendQueuedMessage(sock, jid, content, options = {}) {
+    if (sock && sock !== defaultQueue.getSocket()) {
+        defaultQueue.setSocket(sock)
+    }
+    return defaultQueue.enqueue(jid, content, options)
+}
 
 // Silenciar avisos criptográficos internos de bajo nivel de libsignal (SessionEntry, buffers)
 const _originalConsoleInfo = console.info
@@ -517,9 +526,9 @@ async function sendReportConfirmationInterface(sock, sender, currentSession, mod
 
     if (mode === 'POLL') {
         try {
-            await sock.sendMessage(sender, { text: summaryText })
+            await sendQueuedMessage(sock, sender, { text: summaryText })
 
-            const confirmPollMsg = await sock.sendMessage(sender, {
+            const confirmPollMsg = await sendQueuedMessage(sock, sender, {
                 poll: {
                     name: '👉 ¿Confirmás los datos para enviar el reporte?',
                     values: ['1. Confirmar y enviar', '0. Cancelar'],
@@ -554,7 +563,7 @@ async function sendReportConfirmationInterface(sock, sender, currentSession, mod
         `👉 Respondé *1* o *CONFIRMAR* para enviar.\n` +
         `👉 Respondé *0* o *CANCELAR* para salir.`
 
-    const sent = await sock.sendMessage(sender, { text: classicSummary })
+    const sent = await sendQueuedMessage(sock, sender, { text: classicSummary })
     addLog('message_out', `Resumen de reporte enviado para confirmación (modo texto clásico) a ${sender}`)
     return sent
 }
@@ -567,7 +576,7 @@ async function executeReportConfirmation(sock, sender, session) {
     if (confirmedSession.latitude == null || confirmedSession.longitude == null) {
         const invalidCoordsMsg = `No se detectaron coordenadas válidas para este reporte. Escribí *REPORTAR* para iniciar un reporte nuevo.`
         deleteSession(sender)
-        await sock.sendMessage(sender, { text: invalidCoordsMsg })
+        await sendQueuedMessage(sock, sender, { text: invalidCoordsMsg })
         return true
     }
 
@@ -591,7 +600,7 @@ async function executeReportConfirmation(sock, sender, session) {
     } catch (err) {
         addLog('error', `Fallo al registrar reporte en pending_sync_reports para ${sender}: ${err.message}`)
         const dbFailMsg = `⚠️ Ocurrió un error al registrar tu reporte localmente. Por favor respondé *1* para intentar confirmar nuevamente.`
-        await sock.sendMessage(sender, { text: dbFailMsg })
+        await sendQueuedMessage(sock, sender, { text: dbFailMsg })
         return true
     }
 
@@ -600,7 +609,7 @@ async function executeReportConfirmation(sock, sender, session) {
 
     // 3. Enviar confirmación al usuario
     const finalMsg = `✅ *¡Reporte recibido correctamente!*\n\n¡Muchas gracias por tu colaboración! 🙌\n\nTu reporte contribuirá al monitoreo de inundaciones urbanas y a la identificación de zonas afectadas.\n\n🗺️ *¡Explorá nuestro mapa interactivo!*\n\nPodés visualizar los reportes de inundaciones en nuestra plataforma web:\n\n🔗 https://mapa-chi-steel.vercel.app/`
-    await sock.sendMessage(sender, { text: finalMsg })
+    await sendQueuedMessage(sock, sender, { text: finalMsg })
     addLog('message_out', `Reporte confirmado por ${sender} (ID pendiente: ${reportId}). Sesión cerrada.`)
 
     // 4. Disparar sincronización asíncrona hacia Supabase (no bloquea al usuario)
@@ -617,7 +626,7 @@ async function sendAffectationPoll(sock, sender) {
     let pollEncKeyHex = null
 
     try {
-        const sentMsg = await sock.sendMessage(sender, {
+        const sentMsg = await sendQueuedMessage(sock, sender, {
             poll: {
                 name: '⛈️ Seleccioná las afectaciones (Opcional):',
                 values: AFFECTATION_CATEGORIES.map((cat, i) => `${i + 1}. ${cat}`),
@@ -655,7 +664,7 @@ async function sendAffectationPoll(sock, sender) {
 
     // Directamente al mensaje de descripción opcional (sin pregunta intermedia)
     const descPrompt = `✍️ *Descripción del incidente (opcional)*\n\n¿Querés agregar algún detalle sobre lo ocurrido?\n\n👉 Escribí tu descripción o respondé *1* para omitir.`
-    await sock.sendMessage(sender, { text: descPrompt })
+    await sendQueuedMessage(sock, sender, { text: descPrompt })
     addLog('message_out', `Solicitud de descripción enviada a ${sender}`)
 }
 
@@ -728,8 +737,8 @@ async function handleFloodReportFlow(sock, sender, msg) {
 
         const locationPrompt = `📍 *Paso 1: Ubicación*\n\nPor favor, compartí la ubicación del lugar donde está ocurriendo la inundación.\n\nPodés enviar tu ubicación actual o seleccionar otro punto en el mapa.`
 
-        await sock.sendMessage(sender, { text: welcomeMsg })
-        await sock.sendMessage(sender, { text: locationPrompt })
+        await sendQueuedMessage(sock, sender, { text: welcomeMsg })
+        await sendQueuedMessage(sock, sender, { text: locationPrompt })
         addLog('message_out', `Bienvenida y solicitud de ubicación enviadas a ${sender}`)
         return true
     }
@@ -744,7 +753,7 @@ async function handleFloodReportFlow(sock, sender, msg) {
     if (isCancelCommand) {
         deleteSession(sender)
         const cancelMsg = 'Reporte cancelado. Escribí *REPORTAR* cuando quieras comenzar de nuevo.'
-        await sock.sendMessage(sender, { text: cancelMsg })
+        await sendQueuedMessage(sock, sender, { text: cancelMsg })
         addLog('message_out', `Flujo cancelado por usuario: ${sender}`)
         return true
     }
@@ -890,7 +899,7 @@ async function handleFloodReportFlow(sock, sender, msg) {
                                     addLog('info', `❌ Opción 'Cancelar' seleccionada en encuesta interactiva por ${sender}`)
                                     deleteSession(sender)
                                     const cancelMsg = 'Reporte cancelado. Escribí *REPORTAR* cuando quieras comenzar de nuevo.'
-                                    await sock.sendMessage(sender, { text: cancelMsg })
+                                    await sendQueuedMessage(sock, sender, { text: cancelMsg })
                                     return true
                                 }
                             }
@@ -942,14 +951,14 @@ async function handleFloodReportFlow(sock, sender, msg) {
 
             const confirmMsg = `✅ ¡Ubicación recibida con éxito! 📍\nCoordenadas: ${lat.toFixed(6)}, ${lng.toFixed(6)}\n\n📸 *Fotografía del incidente*\n\nPor favor enviá una fotografía del lugar como evidencia para continuar.`
 
-            await sock.sendMessage(sender, { text: confirmMsg })
+            await sendQueuedMessage(sock, sender, { text: confirmMsg })
             addLog('message_out', `Ubicación GPS guardada (${lat}, ${lng}) para ${sender}`)
             return true
         }
 
         const helpMsg = `Para continuar, compartí la ubicación del lugar afectado.`
         db.prepare('UPDATE report_sessions SET updated_at = CURRENT_TIMESTAMP WHERE user_jid = ?').run(sender)
-        await sock.sendMessage(sender, { text: helpMsg })
+        await sendQueuedMessage(sock, sender, { text: helpMsg })
         return true
     }
 
@@ -986,14 +995,14 @@ async function handleFloodReportFlow(sock, sender, msg) {
             } catch (err) {
                 addLog('error', `Error al descargar fotografía: ${err.message}`)
                 const errorMsg = `No pudimos procesar la imagen. Por favor intentá enviarla nuevamente.`
-                await sock.sendMessage(sender, { text: errorMsg })
+                await sendQueuedMessage(sock, sender, { text: errorMsg })
                 return true
             }
         }
 
         const helpMsg = `Necesitamos una fotografía del lugar para continuar.`
         db.prepare('UPDATE report_sessions SET updated_at = CURRENT_TIMESTAMP WHERE user_jid = ?').run(sender)
-        await sock.sendMessage(sender, { text: helpMsg })
+        await sendQueuedMessage(sock, sender, { text: helpMsg })
         return true
     }
 
@@ -1002,7 +1011,7 @@ async function handleFloodReportFlow(sock, sender, msg) {
         if (text === '0' || lowerText === 'cancelar') {
             deleteSession(sender)
             const cancelMsg = 'Reporte cancelado. Escribí *REPORTAR* cuando quieras comenzar de nuevo.'
-            await sock.sendMessage(sender, { text: cancelMsg })
+            await sendQueuedMessage(sock, sender, { text: cancelMsg })
             return true
         }
 
@@ -1035,7 +1044,7 @@ async function handleFloodReportFlow(sock, sender, msg) {
 
         const helpDesc = `✍️ *Descripción del incidente (opcional)*\n\n¿Querés agregar algún detalle sobre lo ocurrido?\n\n👉 Escribí tu descripción o respondé *1* para omitir.`
         db.prepare('UPDATE report_sessions SET updated_at = CURRENT_TIMESTAMP WHERE user_jid = ?').run(sender)
-        await sock.sendMessage(sender, { text: helpDesc })
+        await sendQueuedMessage(sock, sender, { text: helpDesc })
         return true
     }
 
@@ -1044,7 +1053,7 @@ async function handleFloodReportFlow(sock, sender, msg) {
         if (text === '0' || lowerText === 'cancelar') {
             deleteSession(sender)
             const cancelMsg = 'Reporte cancelado. Escribí *REPORTAR* cuando quieras comenzar de nuevo.'
-            await sock.sendMessage(sender, { text: cancelMsg })
+            await sendQueuedMessage(sock, sender, { text: cancelMsg })
             return true
         }
 
@@ -1077,7 +1086,7 @@ async function handleFloodReportFlow(sock, sender, msg) {
 
         const helpDesc = `✍️ *Descripción del incidente (opcional)*\n\n¿Querés agregar algún detalle sobre lo ocurrido?\n\n👉 Escribí tu descripción o respondé *1* para omitir.`
         db.prepare('UPDATE report_sessions SET updated_at = CURRENT_TIMESTAMP WHERE user_jid = ?').run(sender)
-        await sock.sendMessage(sender, { text: helpDesc })
+        await sendQueuedMessage(sock, sender, { text: helpDesc })
         return true
     }
 
@@ -1090,13 +1099,13 @@ async function handleFloodReportFlow(sock, sender, msg) {
         if (text === '0' || lowerText === 'cancelar') {
             deleteSession(sender)
             const cancelMsg = 'Reporte cancelado. Escribí *REPORTAR* cuando quieras comenzar de nuevo.'
-            await sock.sendMessage(sender, { text: cancelMsg })
+            await sendQueuedMessage(sock, sender, { text: cancelMsg })
             return true
         }
 
         const reConfirmMsg = `Para finalizar, respondé *1* o *CONFIRMAR* para enviar el reporte, o *0* o *CANCELAR* para descartarlo.`
         db.prepare('UPDATE report_sessions SET updated_at = CURRENT_TIMESTAMP WHERE user_jid = ?').run(sender)
-        await sock.sendMessage(sender, { text: reConfirmMsg })
+        await sendQueuedMessage(sock, sender, { text: reConfirmMsg })
         return true
     }
 
@@ -1134,6 +1143,9 @@ async function connectToWhatsApp() {
         logger: pino({ level: 'silent' })
     })
 
+    // Asignar el socket activo a la cola de salida
+    defaultQueue.setSocket(sock)
+
     // Vinculación segura por consola si el número no está registrado aún
     if (!state.creds.registered) {
         console.log('\n======================================================')
@@ -1163,6 +1175,8 @@ async function connectToWhatsApp() {
         const { connection, lastDisconnect } = update
 
         if (connection === 'close') {
+            defaultQueue.pause()
+
             const statusCode = (lastDisconnect?.error instanceof Boom)
                 ? lastDisconnect.error.output?.statusCode
                 : lastDisconnect?.error?.statusCode || 'unknown'
@@ -1182,6 +1196,9 @@ async function connectToWhatsApp() {
         } else if (connection === 'connecting') {
             console.log('⏳ Conectando con los servidores de WhatsApp...')
         } else if (connection === 'open') {
+            defaultQueue.setSocket(sock)
+            defaultQueue.resume()
+
             const botNumber = sock.user?.id?.split(':')[0] || sock.user?.id?.split('@')[0] || 'Desconocido'
             console.log('\n======================================================')
             console.log(`✅ WHATSAPP CONECTADO EXITOSAMENTE`)
@@ -1268,6 +1285,8 @@ if (process.env.NODE_ENV === 'test') {
         sendReportConfirmationInterface,
         executeReportConfirmation,
         sendAffectationPoll,
+        defaultQueue,
+        sendQueuedMessage,
         DECISION_INTERFACE_MODE: null,
         sendContinueOrCancelInterface: null,
         EXPERIMENTAL_BUTTONS_ENABLED: false,
