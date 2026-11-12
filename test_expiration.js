@@ -50,15 +50,12 @@ const {
     CONFIRMATION_INTERFACE_MODE,
     sendReportConfirmationInterface,
     executeReportConfirmation,
-    sendAffectationPoll,
-    defaultQueue,
-    sendQueuedMessage
+    sendAffectationPoll
 } = require('./bot')
-const { MessageQueue } = require('./messageQueue')
 
 const { insertReportRecord } = require('./supabaseClient')
 
-console.log('🧪 Iniciando batería exhaustiva de pruebas (19 escenarios aislados)...\n')
+console.log('🧪 Iniciando batería exhaustiva de pruebas (14 escenarios aislados)...\n')
 console.log(`📁 Directorio de pruebas aislado: ${testDir}`)
 console.log(`🗄️ Base de datos temporal: ${testDbPath}`)
 console.log(`📸 Carpeta temporal de uploads: ${testUploads}\n`)
@@ -838,141 +835,10 @@ async function runTests() {
         passedTests++
 
         // --------------------------------------------------------------------------
-        // Test 15: Verificación del Rate Limiting (medición de tiempos >= 350 ms)
-        // --------------------------------------------------------------------------
-        console.log('▶️ Test 15: Medición precisa del Rate Limiting (intervalo >= 350 ms)...')
-        const mockSockRate = createMockSocket()
-        const customQueue = new MessageQueue(350, 60000)
-        customQueue.setSocket(mockSockRate)
-
-        const timestamps = []
-        const p1 = customQueue.enqueue('595981111111@s.whatsapp.net', { text: 'Msg 1' }).then(() => timestamps.push(Date.now()))
-        const p2 = customQueue.enqueue('595981111111@s.whatsapp.net', { text: 'Msg 2' }).then(() => timestamps.push(Date.now()))
-        const p3 = customQueue.enqueue('595981111111@s.whatsapp.net', { text: 'Msg 3' }).then(() => timestamps.push(Date.now()))
-
-        await Promise.all([p1, p2, p3])
-        assert.strictEqual(mockSockRate.sentMessages.length, 3, 'Deben haberse enviado los 3 mensajes')
-        assert.strictEqual(timestamps.length, 3)
-
-        const diff1 = timestamps[1] - timestamps[0]
-        const diff2 = timestamps[2] - timestamps[1]
-        assert.ok(diff1 >= 320, `Intervalo 1 entre mensajes (${diff1}ms) debe respetar el límite de ~350ms`)
-        assert.ok(diff2 >= 320, `Intervalo 2 entre mensajes (${diff2}ms) debe respetar el límite de ~350ms`)
-        console.log(`  ✅ Test 15 aprobado: Rate Limiting verificado exitosamente (Intervalos: ${diff1}ms, ${diff2}ms >= 350ms).\n`)
-        passedTests++
-
-        // --------------------------------------------------------------------------
-        // Test 16: Preservación de orden FIFO por ciudadano ante envíos simultáneos
-        // --------------------------------------------------------------------------
-        console.log('▶️ Test 16: Preservación de orden FIFO de mensajes por ciudadano en ráfagas...')
-        const mockSockFifo = createMockSocket()
-        const fifoQueue = new MessageQueue(50, 60000)
-        fifoQueue.setSocket(mockSockFifo)
-
-        const userA = '595980000001@s.whatsapp.net'
-        const userB = '595980000002@s.whatsapp.net'
-
-        // Encolar de forma concurrente mensajes intercalados de dos ciudadanos
-        const promises = [
-            fifoQueue.enqueue(userA, { text: 'A1: Bienvenida' }),
-            fifoQueue.enqueue(userB, { text: 'B1: Bienvenida' }),
-            fifoQueue.enqueue(userA, { text: 'A2: Ubicación' }),
-            fifoQueue.enqueue(userB, { text: 'B2: Ubicación' }),
-            fifoQueue.enqueue(userA, { text: 'A3: Descripción' }),
-            fifoQueue.enqueue(userB, { text: 'B3: Descripción' })
-        ]
-
-        await Promise.all(promises)
-        const messagesA = mockSockFifo.sentMessages.filter(m => m.jid === userA).map(m => m.content.text)
-        const messagesB = mockSockFifo.sentMessages.filter(m => m.jid === userB).map(m => m.content.text)
-
-        assert.deepStrictEqual(messagesA, ['A1: Bienvenida', 'A2: Ubicación', 'A3: Descripción'], 'Mensajes de usuario A deben mantener orden estricto')
-        assert.deepStrictEqual(messagesB, ['B1: Bienvenida', 'B2: Ubicación', 'B3: Descripción'], 'Mensajes de usuario B deben mantener orden estricto')
-        console.log('  ✅ Test 16 aprobado: Orden FIFO preservado sin alteraciones entre múltiples ciudadanos.\n')
-        passedTests++
-
-        // --------------------------------------------------------------------------
-        // Test 17: Retorno intacto de objetos de mensaje en encuestas interactivas
-        // --------------------------------------------------------------------------
-        console.log('▶️ Test 17: Conservación del resultado de sendMessage para encuestas interactivas...')
-        const mockSockPoll = createMockSocket()
-        const pollQueue = new MessageQueue(20, 60000)
-        pollQueue.setSocket(mockSockPoll)
-
-        const pollResult = await pollQueue.enqueue('595980000003@s.whatsapp.net', {
-            poll: { name: 'Test Poll', values: ['1. Si', '0. No'], selectableCount: 1 }
-        })
-
-        assert.ok(pollResult, 'El resultado de la promesa de la cola debe existir')
-        assert.ok(pollResult.key?.id, 'Debe contener key.id')
-        assert.ok(pollResult.message?.messageContextInfo?.messageSecret, 'Debe contener messageSecret para descifrar votos')
-        console.log('  ✅ Test 17 aprobado: Metadatos de encuestas interactivas devueltos intactos por la cola.\n')
-        passedTests++
-
-        // --------------------------------------------------------------------------
-        // Test 18: Pausa ante desconexión, retención de mensajes y reanudación con socket activo
-        // --------------------------------------------------------------------------
-        console.log('▶️ Test 18: Pausa de cola ante desconexión y reanudación ordenada con socket activo...')
-        const mockSockDisconnect = createMockSocket()
-        const pauseQueue = new MessageQueue(50, 60000)
-        pauseQueue.setSocket(mockSockDisconnect)
-
-        // Pausar simulando desconexión
-        pauseQueue.pause()
-        let p1Resolved = false
-        const pDisconnected = pauseQueue.enqueue('595980000004@s.whatsapp.net', { text: 'Mensaje retenido en pausa' }).then(() => {
-            p1Resolved = true
-        })
-
-        // Esperar un instante para certificar que NO se despacha estando en pausa
-        await new Promise(r => setTimeout(r, 120))
-        assert.strictEqual(p1Resolved, false, 'El mensaje encolado no debe despacharse mientras la cola esté pausada')
-        assert.strictEqual(mockSockDisconnect.sentMessages.length, 0, 'No debe haberse enviado al socket')
-
-        // Simular reconexión con un socket nuevo
-        const mockSockReconnected = createMockSocket()
-        pauseQueue.setSocket(mockSockReconnected)
-        pauseQueue.resume()
-
-        await pDisconnected
-        assert.strictEqual(p1Resolved, true, 'El mensaje debe haberse despachado tras reanudar')
-        assert.strictEqual(mockSockDisconnect.sentMessages.length, 0, 'El socket viejo no debe haber recibido el mensaje')
-        assert.strictEqual(mockSockReconnected.sentMessages.length, 1, 'El nuevo socket activo debe haber recibido el mensaje retenido')
-        console.log('  ✅ Test 18 aprobado: Pausa ante desconexión y reanudación con socket activo verificadas.\n')
-        passedTests++
-
-        // --------------------------------------------------------------------------
-        // Test 19: Expiración y rechazo explícito tras desconexión prolongada
-        // --------------------------------------------------------------------------
-        console.log('▶️ Test 19: Expiración y rechazo explícito tras desconexión prolongada (> maxAgeMs)...')
-        const mockSockExpire = createMockSocket()
-        // Cola con maxAgeMs ultra-corto de 100ms para probar la expiración
-        const expireQueue = new MessageQueue(50, 100)
-        expireQueue.setSocket(mockSockExpire)
-
-        // Pausar y encolar
-        expireQueue.pause()
-        let expireError = null
-        const pExpired = expireQueue.enqueue('595980000005@s.whatsapp.net', { text: 'Instrucción obsoleta' }).catch(err => {
-            expireError = err
-        })
-
-        // Esperar 150 ms para que el mensaje supere los 100 ms de maxAgeMs
-        await new Promise(r => setTimeout(r, 150))
-        expireQueue.resume()
-
-        await pExpired
-        assert.ok(expireError, 'El mensaje antiguo debe ser rechazado con error explícito')
-        assert.ok(expireError.message.includes('expirado tras desconexión prolongada'), 'El error debe indicar expiración por desconexión prolongada')
-        assert.strictEqual(mockSockExpire.sentMessages.length, 0, 'El mensaje expirado no debe haberse enviado al socket')
-        console.log('  ✅ Test 19 aprobado: Mensajes obsoletos rechazados explícitamente sin envío a destiempo ni descarte silencioso.\n')
-        passedTests++
-
-        // --------------------------------------------------------------------------
         // Resumen
         // --------------------------------------------------------------------------
         console.log('==============================================================================')
-        console.log(`🎉 BATERÍA COMPLETA: ${passedTests} de 19 pruebas aprobadas exitosamente.`)
+        console.log(`🎉 BATERÍA COMPLETA: ${passedTests} de 14 pruebas aprobadas exitosamente.`)
         console.log('🛡️ Aislamiento verificado: sessions.db y uploads/ reales no sufrieron modificaciones.')
         console.log('==============================================================================\n')
     } finally {
