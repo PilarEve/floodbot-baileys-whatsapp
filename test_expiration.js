@@ -31,6 +31,20 @@ process.env.UPLOADS_DIR = testUploads
 process.env.DB_PATH = testDbPath
 process.env.AUTH_DIR = path.join(testDir, 'auth_test')
 
+// Interceptar @whiskeysockets/baileys para que downloadMediaMessage simule la descarga de fotos sin red
+const Module = require('module')
+const originalRequire = Module.prototype.require
+Module.prototype.require = function (modulePath) {
+    const loadedModule = originalRequire.apply(this, arguments)
+    if (modulePath === '@whiskeysockets/baileys') {
+        return {
+            ...loadedModule,
+            downloadMediaMessage: async () => Buffer.from('FAKE_TEST_JPEG_DATA_BUFFER')
+        }
+    }
+    return loadedModule
+}
+
 const {
     db,
     closeDatabase,
@@ -44,6 +58,7 @@ const {
     getNextRetryDelayMs,
     processSinglePendingReport,
     triggerSyncPendingReports,
+    updateSavedReportData,
     handleFloodReportFlow,
     UPLOADS_DIR,
     DB_PATH,
@@ -51,14 +66,16 @@ const {
     sendReportConfirmationInterface,
     executeReportConfirmation,
     sendAffectationPoll,
+    AFFECTATION_CATEGORIES,
+    FINAL_SUCCESS_MESSAGE,
     defaultQueue,
     sendQueuedMessage
 } = require('./bot')
 const { MessageQueue } = require('./messageQueue')
 
-const { insertReportRecord } = require('./supabaseClient')
+const { insertReportRecord, updateReportRecord, deleteReportRecord } = require('./supabaseClient')
 
-console.log('🧪 Iniciando batería exhaustiva de pruebas (19 escenarios aislados)...\n')
+console.log('🧪 Iniciando batería exhaustiva de pruebas (26 escenarios aislados)...\n')
 console.log(`📁 Directorio de pruebas aislado: ${testDir}`)
 console.log(`🗄️ Base de datos temporal: ${testDbPath}`)
 console.log(`📸 Carpeta temporal de uploads: ${testUploads}\n`)
@@ -118,17 +135,19 @@ let passedTests = 0
 async function runTests() {
     try {
         // --------------------------------------------------------------------------
-        // Test 1: Precisión de expiración por inactividad (>30 min) y reinicio silencioso
+        // Test 1: Precisión de expiración por inactividad (>15 min) y reinicio silencioso
         // --------------------------------------------------------------------------
         console.log('▶️ Test 1: Precisión de timestamps UTC y reinicio silencioso tras inactividad...')
+        assert.strictEqual(SESSION_TIMEOUT_MS, 15 * 60 * 1000, 'SESSION_TIMEOUT_MS debe ser de 15 minutos exactos')
+
         const nowUtcStr = new Date().toISOString().replace('T', ' ').slice(0, 19)
         assert.strictEqual(isSessionExpired({ updated_at: nowUtcStr }), false, 'Sesión actual no debe expirar')
 
         const tenMinAgo = new Date(Date.now() - 10 * 60 * 1000).toISOString().replace('T', ' ').slice(0, 19)
         assert.strictEqual(isSessionExpired({ updated_at: tenMinAgo }), false, 'Sesión de 10 min no debe expirar')
 
-        const thirtyMinAgo = new Date(Date.now() - 30 * 60 * 1000).toISOString().replace('T', ' ').slice(0, 19)
-        assert.strictEqual(isSessionExpired({ updated_at: thirtyMinAgo }), true, 'Sesión de 30 min debe expirar')
+        const sixteenMinAgo = new Date(Date.now() - 16 * 60 * 1000).toISOString().replace('T', ' ').slice(0, 19)
+        assert.strictEqual(isSessionExpired({ updated_at: sixteenMinAgo }), true, 'Sesión de 16 min (>15 min) debe expirar')
 
         const testUser1 = '595982222222@s.whatsapp.net'
         deleteSession(testUser1)
@@ -138,7 +157,7 @@ async function runTests() {
 
         db.prepare(`
             INSERT INTO report_sessions (user_jid, state, photo_path, updated_at)
-            VALUES (?, 'AWAITING_PHOTO', ?, datetime('now', '-40 minutes'))
+            VALUES (?, 'AWAITING_PHOTO', ?, datetime('now', '-20 minutes'))
         `).run(testUser1, dummyPhoto)
 
         const mockSock1 = createMockSocket()
@@ -595,7 +614,7 @@ async function runTests() {
         assert.strictEqual(sessionAfterAffVote.state, 'AWAITING_DESCRIPTION', 'Debe mantenerse en AWAITING_DESCRIPTION')
         assert.ok(sessionAfterAffVote.selected_affectations.includes('Calle inundada'), 'Debe guardar la afectación seleccionada silenciosamente')
 
-        // 13c: Enviar descripción en texto avanza directamente a AWAITING_CONFIRMATION y emite el resumen
+        // 13c: Enviar descripción en texto finaliza directamente el reporte sin paso de confirmación intermedia
         const mockSockDesc = createMockSocket()
         await handleFloodReportFlow(mockSockDesc, testUserDirect, {
             key: { remoteJid: testUserDirect, id: 'MSG_DESC_TEXT' },
@@ -603,11 +622,12 @@ async function runTests() {
         })
 
         const sessionAfterDesc = db.prepare('SELECT state, description FROM report_sessions WHERE user_jid = ?').get(testUserDirect)
-        assert.strictEqual(sessionAfterDesc.state, 'AWAITING_CONFIRMATION', 'Enviar descripción debe avanzar a AWAITING_CONFIRMATION')
-        assert.strictEqual(sessionAfterDesc.description, 'El agua sobrepasó la vereda y entró a la cochera')
-        assert.ok(mockSockDesc.sentMessages.length > 0, 'Debe haber emitido el resumen de confirmación')
+        assert.strictEqual(sessionAfterDesc, undefined, 'Enviar descripción debe cerrar la sesión sin confirmación intermedia')
+        assert.ok(mockSockDesc.sentMessages.length >= 2, 'Debe haber emitido el resumen y el mensaje final de agradecimiento')
+        assert.ok(mockSockDesc.sentMessages[0].content.text.includes('Resumen de tu reporte'), 'Primer mensaje debe ser el resumen')
+        assert.strictEqual(mockSockDesc.sentMessages[1].content.text, FINAL_SUCCESS_MESSAGE, 'Segundo mensaje debe ser el mensaje final original')
 
-        // 13d: Omitir descripción respondiendo 1 avanza directamente a AWAITING_CONFIRMATION
+        // 13d: Omitir descripción respondiendo 1 finaliza directamente el reporte
         const userOmit = '595987779999@s.whatsapp.net'
         deleteSession(userOmit)
         db.prepare(`
@@ -622,8 +642,10 @@ async function runTests() {
         })
 
         const sessionAfterOmit = db.prepare('SELECT state, description FROM report_sessions WHERE user_jid = ?').get(userOmit)
-        assert.strictEqual(sessionAfterOmit.state, 'AWAITING_CONFIRMATION', 'Responder 1 debe avanzar a AWAITING_CONFIRMATION')
-        assert.strictEqual(sessionAfterOmit.description, null, 'Descripción debe ser null al omitir')
+        assert.strictEqual(sessionAfterOmit, undefined, 'Responder 1 debe cerrar la sesión sin confirmación')
+        assert.ok(mockSockOmit.sentMessages.length >= 2, 'Debe haber emitido el resumen y el mensaje final')
+        assert.ok(mockSockOmit.sentMessages[0].content.text.includes('Resumen de tu reporte'), 'Primer mensaje debe ser el resumen')
+        assert.strictEqual(mockSockOmit.sentMessages[1].content.text, FINAL_SUCCESS_MESSAGE, 'Segundo mensaje debe ser el mensaje final original')
 
         // 13e: Cancelar en AWAITING_DESCRIPTION elimina la sesión
         const userCancel13 = '595987770000@s.whatsapp.net'
@@ -656,7 +678,10 @@ async function runTests() {
             message: { conversation: '1' }
         })
         const sessionAfterLegacy = db.prepare('SELECT state FROM report_sessions WHERE user_jid = ?').get(userLegacy)
-        assert.strictEqual(sessionAfterLegacy.state, 'AWAITING_CONFIRMATION', 'Sesión recuperada en AWAITING_AFFECTATIONS_AND_DESC debe avanzar fluidamente')
+        assert.strictEqual(sessionAfterLegacy, undefined, 'Sesión recuperada en AWAITING_AFFECTATIONS_AND_DESC debe finalizar directamente')
+        assert.ok(mockSockLegacy.sentMessages.length >= 2)
+        assert.ok(mockSockLegacy.sentMessages[0].content.text.includes('Resumen de tu reporte'))
+        assert.strictEqual(mockSockLegacy.sentMessages[1].content.text, FINAL_SUCCESS_MESSAGE)
 
         deleteSession(testUserDirect)
         deleteSession(userOmit)
@@ -969,10 +994,489 @@ async function runTests() {
         passedTests++
 
         // --------------------------------------------------------------------------
+        // Test 20: Auto-guardado de reporte básico ante abandono tras enviar fotografía
+        // --------------------------------------------------------------------------
+        console.log('▶️ Test 20: Auto-guardado de reporte básico ante abandono tras enviar fotografía...')
+        const userAutoSave = '595989990001@s.whatsapp.net'
+        const mockSock20 = createMockSocket()
+
+        db.prepare(`
+            INSERT INTO report_sessions (user_jid, state, latitude, longitude, updated_at)
+            VALUES (?, 'AWAITING_LOCATION', NULL, NULL, datetime('now'))
+        `).run(userAutoSave)
+
+        // 1. Envío de ubicación GPS -> pasa a AWAITING_PHOTO
+        await handleFloodReportFlow(mockSock20, userAutoSave, {
+            key: { remoteJid: userAutoSave, id: 'MSG_T20_LOC' },
+            message: {
+                locationMessage: {
+                    degreesLatitude: -25.2910,
+                    degreesLongitude: -57.6520
+                }
+            }
+        })
+
+        // 2. Envío de fotografía válida -> auto-guarda y pasa a AWAITING_DESCRIPTION
+        await handleFloodReportFlow(mockSock20, userAutoSave, {
+            key: { remoteJid: userAutoSave, id: 'MSG_T20_PHOTO' },
+            message: {
+                imageMessage: {
+                    mimetype: 'image/jpeg',
+                    caption: ''
+                }
+            }
+        })
+
+        // Verificar que la sesión activa tiene report_id asignado tempranamente
+        const session20 = db.prepare('SELECT state, latitude, longitude, photo_path, report_id FROM report_sessions WHERE user_jid = ?').get(userAutoSave)
+        assert.ok(session20, 'La sesión conversacional debe existir')
+        assert.strictEqual(session20.state, 'AWAITING_DESCRIPTION')
+        assert.ok(session20.report_id, 'Debe haberse generado un UUID report_id temprano')
+        assert.ok(fs.existsSync(session20.photo_path), 'La fotografía debe haberse guardado en disco')
+
+        // Verificar que el reporte básico se insertó de inmediato en pending_sync_reports
+        const pending20 = db.prepare('SELECT id, user_jid, latitude, longitude, description, selected_affectations, photo_path, status FROM pending_sync_reports WHERE id = ?').get(session20.report_id)
+        assert.ok(pending20, 'El reporte básico debe residir en pending_sync_reports sin esperar confirmación')
+        assert.strictEqual(pending20.user_jid, userAutoSave)
+        assert.strictEqual(pending20.latitude, -25.2910)
+        assert.strictEqual(pending20.longitude, -57.6520)
+        assert.strictEqual(pending20.description, 'Sin descripción')
+        assert.strictEqual(pending20.selected_affectations, '[]')
+        console.log('  ✅ Test 20 aprobado: Reporte básico auto-guardado en SQLite inmediatamente al recibir foto.\n')
+        passedTests++
+
+        // --------------------------------------------------------------------------
+        // Test 21: Expiración por inactividad (>15 min) tras auto-guardado conserva el reporte y envía mensaje original
+        // --------------------------------------------------------------------------
+        console.log('▶️ Test 21: Expiración por inactividad (>15 min) conserva reporte y envía mensaje original...')
+        // Simular que el usuario 20 abandonó la conversación y pasaron 16 minutos (> 15 min)
+        db.prepare("UPDATE report_sessions SET updated_at = datetime('now', '-16 minutes') WHERE user_jid = ?").run(userAutoSave)
+
+        // Ejecutar rutina de mantenimiento y limpieza con socket simulado
+        const mockSockCleanup21 = createMockSocket()
+        await cleanupExpiredSessionsAndFiles(mockSockCleanup21)
+
+        // La sesión conversacional debe haberse eliminado para liberar el chat
+        const session21After = db.prepare('SELECT state FROM report_sessions WHERE user_jid = ?').get(userAutoSave)
+        assert.strictEqual(session21After, undefined, 'La sesión conversacional expirada debe cerrarse')
+
+        // Debe haber enviado el mensaje final original exacto
+        assert.strictEqual(mockSockCleanup21.sentMessages.length, 1, 'Debe haber enviado exactamente el mensaje final de agradecimiento')
+        assert.strictEqual(mockSockCleanup21.sentMessages[0].content.text, FINAL_SUCCESS_MESSAGE, 'El mensaje debe ser el mensaje final original exacto')
+
+        // Pero el reporte auto-guardado en pending_sync_reports y su fotografía DEBEN CONSERVARSE
+        const pending21After = db.prepare('SELECT id, photo_path FROM pending_sync_reports WHERE id = ?').get(session20.report_id)
+        assert.ok(pending21After, 'El reporte auto-guardado debe permanecer intacto tras expiración de sesión')
+        assert.ok(fs.existsSync(pending21After.photo_path), 'La fotografía del reporte pendiente no debe eliminarse por inactividad')
+        console.log('  ✅ Test 21 aprobado: Inactividad cierra el diálogo pero preserva el reporte y su fotografía.\n')
+        passedTests++
+
+        // --------------------------------------------------------------------------
+        // Test 22: Continuación con afectaciones y descripción enriqueciendo el mismo reporte
+        // --------------------------------------------------------------------------
+        console.log('▶️ Test 22: Continuación con afectaciones y descripción enriqueciendo el mismo reporte...')
+        const userFlow = '595989990002@s.whatsapp.net'
+        const mockSock22 = createMockSocket()
+
+        db.prepare(`
+            INSERT INTO report_sessions (user_jid, state, latitude, longitude, updated_at)
+            VALUES (?, 'AWAITING_LOCATION', NULL, NULL, datetime('now'))
+        `).run(userFlow)
+
+        // Ubicación
+        await handleFloodReportFlow(mockSock22, userFlow, {
+            key: { remoteJid: userFlow, id: 'MSG_T22_LOC' },
+            message: { locationMessage: { degreesLatitude: -25.2950, degreesLongitude: -57.6550 } }
+        })
+        // Foto
+        await handleFloodReportFlow(mockSock22, userFlow, {
+            key: { remoteJid: userFlow, id: 'MSG_T22_PHOTO' },
+            message: { imageMessage: { mimetype: 'image/jpeg' } }
+        })
+
+        const session22 = db.prepare('SELECT report_id, photo_path FROM report_sessions WHERE user_jid = ?').get(userFlow)
+        const initialReportId = session22.report_id
+        assert.ok(initialReportId, 'Debe haberse generado report_id')
+
+        // Enviar descripción
+        await handleFloodReportFlow(mockSock22, userFlow, {
+            key: { remoteJid: userFlow, id: 'MSG_T22_DESC' },
+            message: { conversation: 'El agua sobrepasó el muro perimetral' }
+        })
+
+        // Comprobar que en pending_sync_reports se actualizó la descripción bajo el MISMO report_id
+        const pending22 = db.prepare('SELECT id, description, selected_affectations FROM pending_sync_reports WHERE id = ?').get(initialReportId)
+        assert.ok(pending22, 'Debe existir el reporte con el mismo UUID')
+        assert.strictEqual(pending22.id, initialReportId, 'El UUID del reporte debe ser exactamente el mismo')
+        assert.strictEqual(pending22.description, 'El agua sobrepasó el muro perimetral', 'La descripción debe haberse actualizado en el mismo registro')
+
+        // La sesión debe haberse cerrado
+        const session22After = db.prepare('SELECT state FROM report_sessions WHERE user_jid = ?').get(userFlow)
+        assert.strictEqual(session22After, undefined, 'La sesión conversacional debe cerrarse al completar descripción')
+
+        const lastMsg22 = mockSock22.sentMessages[mockSock22.sentMessages.length - 1]
+        assert.strictEqual(lastMsg22.content.text, FINAL_SUCCESS_MESSAGE, 'Debe emitir el mensaje final original')
+        const summaryMsg22 = mockSock22.sentMessages[mockSock22.sentMessages.length - 2]
+        assert.ok(summaryMsg22.content.text.includes('Resumen de tu reporte'), 'Debe emitir el resumen del reporte')
+
+        console.log('  ✅ Test 22 aprobado: Afectaciones y descripción enriquecen el mismo reporte y finalizan fluidamente.\n')
+        passedTests++
+
+        // --------------------------------------------------------------------------
+        // Test 23: Prevención de mensajes de despedida duplicados y confirmación eliminada
+        // --------------------------------------------------------------------------
+        console.log('▶️ Test 23: Prevención de mensajes de despedida duplicados tras finalización...')
+        // La sesión conversacional de userFlow ya se cerró directamente al completar la descripción en Test 22
+        const session23After = db.prepare('SELECT state FROM report_sessions WHERE user_jid = ?').get(userFlow)
+        assert.strictEqual(session23After, undefined, 'La sesión conversacional debe estar cerrada sin requerir paso de confirmación')
+
+        // Al transcurrir 15 minutos y correr el mantenimiento en segundo plano, NO debe emitirse un segundo mensaje
+        const mockSockCleanup23 = createMockSocket()
+        await cleanupExpiredSessionsAndFiles(mockSockCleanup23)
+
+        const userFlowSent = mockSockCleanup23.sentMessages.filter(m => m.jid === userFlow)
+        assert.strictEqual(userFlowSent.length, 0, 'No debe enviarse un segundo mensaje de despedida si la conversación ya terminó normalmente')
+
+        // En pending_sync_reports debe haber EXACTAMENTE UN registro para este usuario
+        const allReportsUser22 = db.prepare('SELECT id FROM pending_sync_reports WHERE user_jid = ?').all(userFlow)
+        assert.strictEqual(allReportsUser22.length, 1, 'No debe crearse un segundo reporte; debe existir exactamente uno')
+        assert.strictEqual(allReportsUser22[0].id, initialReportId, 'El ID del reporte confirmado debe ser el generado originalmente')
+
+        // Mensaje final emitido con éxito en Test 22
+        const checkLastMsg22 = mockSock22.sentMessages[mockSock22.sentMessages.length - 1]
+        assert.strictEqual(checkLastMsg22.content.text, FINAL_SUCCESS_MESSAGE, 'Debe emitir el mensaje final original exacto')
+        console.log('  ✅ Test 23 aprobado: Prevención de mensajes duplicados y finalización directa confirmadas.\n')
+        passedTests++
+
+        // --------------------------------------------------------------------------
+        // Test 24: Cancelación/salida post-foto conserva reporte; previa descarta borrador
+        // --------------------------------------------------------------------------
+        console.log('▶️ Test 24: Salida post-foto conserva reporte; previa descarta borrador...')
+        const userCancel24 = '595989990003@s.whatsapp.net'
+        const mockSock24 = createMockSocket()
+
+        db.prepare(`
+            INSERT INTO report_sessions (user_jid, state, latitude, longitude, updated_at)
+            VALUES (?, 'AWAITING_LOCATION', NULL, NULL, datetime('now'))
+        `).run(userCancel24)
+
+        // Ubicación
+        await handleFloodReportFlow(mockSock24, userCancel24, {
+            key: { remoteJid: userCancel24, id: 'MSG_T24_LOC' },
+            message: { locationMessage: { degreesLatitude: -25.2800, degreesLongitude: -57.6400 } }
+        })
+        // Foto
+        await handleFloodReportFlow(mockSock24, userCancel24, {
+            key: { remoteJid: userCancel24, id: 'MSG_T24_PHOTO' },
+            message: { imageMessage: { mimetype: 'image/jpeg' } }
+        })
+
+        const session24 = db.prepare('SELECT report_id, photo_path FROM report_sessions WHERE user_jid = ?').get(userCancel24)
+        const cancelReportId = session24.report_id
+        const cancelPhotoPath = session24.photo_path
+        assert.ok(fs.existsSync(cancelPhotoPath), 'La foto física existe antes de cancelar')
+
+        // El usuario cancela/sale escribiendo '0' en las preguntas opcionales
+        await handleFloodReportFlow(mockSock24, userCancel24, {
+            key: { remoteJid: userCancel24, id: 'MSG_T24_CANCEL' },
+            message: { conversation: '0' }
+        })
+
+        // Verificar que pending_sync_reports CONSERVA el reporte registrado
+        const pending24 = db.prepare('SELECT id FROM pending_sync_reports WHERE id = ?').get(cancelReportId)
+        assert.ok(pending24, 'El reporte auto-guardado DEBE CONSERVARSE tras salir de las preguntas opcionales')
+
+        // La foto física DEBE mantenerse intacta para la sincronización con Supabase
+        assert.strictEqual(fs.existsSync(cancelPhotoPath), true, 'La fotografía debe conservarse')
+
+        // La sesión debe haberse cerrado
+        const session24After = db.prepare('SELECT state FROM report_sessions WHERE user_jid = ?').get(userCancel24)
+        assert.strictEqual(session24After, undefined, 'La sesión debe haberse cerrado')
+
+        // Caso previo a la foto: cancelar descarta el borrador
+        const userCancelDraft = '595989990004@s.whatsapp.net'
+        const mockSockDraft = createMockSocket()
+        db.prepare(`
+            INSERT INTO report_sessions (user_jid, state, latitude, longitude, updated_at)
+            VALUES (?, 'AWAITING_LOCATION', NULL, NULL, datetime('now'))
+        `).run(userCancelDraft)
+
+        await handleFloodReportFlow(mockSockDraft, userCancelDraft, {
+            key: { remoteJid: userCancelDraft, id: 'MSG_DRAFT_CANCEL' },
+            message: { conversation: '0' }
+        })
+        const sessionDraftAfter = db.prepare('SELECT state FROM report_sessions WHERE user_jid = ?').get(userCancelDraft)
+        assert.strictEqual(sessionDraftAfter, undefined, 'El borrador previo a la foto debe descartarse')
+        assert.ok(mockSockDraft.sentMessages[0].content.text.includes('Reporte cancelado'))
+
+        console.log('  ✅ Test 24 aprobado: Salida post-foto preserva reporte y cancelación previa descarta borrador.\n')
+        passedTests++
+
+        // --------------------------------------------------------------------------
+        // Test 25: Fallo de conexión con Supabase y sincronización diferida exitosa
+        // --------------------------------------------------------------------------
+        console.log('▶️ Test 25: Fallo de conexión con Supabase y sincronización diferida exitosa...')
+        const failReportId = 'rep_fail_net_025'
+        const failPhoto = path.join(testUploads, 'photo_fail_025.jpg')
+        fs.writeFileSync(failPhoto, 'test_fail_025')
+
+        db.prepare(`
+            INSERT INTO pending_sync_reports (id, user_jid, latitude, longitude, selected_affectations, photo_path, description, status)
+            VALUES (?, '595989990004@s.whatsapp.net', -25.30, -57.66, '[]', ?, 'Sin descripción', 'PENDING')
+        `).run(failReportId, failPhoto)
+
+        // 1. Simular Supabase temporalmente inaccesible
+        const mockFailingDeps = {
+            isSupabaseConfigured: () => true,
+            uploadReportPhoto: async () => ({ success: false, error: 'Network 503 Service Unavailable' }),
+            insertReportRecord: async () => ({ success: false, error: 'Network 503' }),
+            updateReportRecord: async () => ({ success: false, error: 'Network 503' })
+        }
+
+        const resFail = await processSinglePendingReport(db.prepare('SELECT * FROM pending_sync_reports WHERE id = ?').get(failReportId), mockFailingDeps)
+        assert.strictEqual(resFail.success, false, 'El intento debe fallar')
+
+        // Verificar que el reporte se retiene en SQLite y la foto no se borra
+        const repAfterFail = db.prepare('SELECT attempts, status FROM pending_sync_reports WHERE id = ?').get(failReportId)
+        assert.strictEqual(repAfterFail.attempts, 1)
+        assert.ok(fs.existsSync(failPhoto), 'La fotografía debe conservarse ante fallo de red')
+
+        // 2. Simular restauración de la conexión con Supabase
+        const mockSuccessDeps = {
+            isSupabaseConfigured: () => true,
+            uploadReportPhoto: async () => ({ success: true, publicUrl: 'https://supabase.co/storage/photo_025.jpg' }),
+            insertReportRecord: async () => ({ success: true, data: { id: failReportId } }),
+            updateReportRecord: async () => ({ success: true, data: { id: failReportId } })
+        }
+
+        const resSuccess = await processSinglePendingReport(db.prepare('SELECT * FROM pending_sync_reports WHERE id = ?').get(failReportId), mockSuccessDeps)
+        assert.strictEqual(resSuccess.success, true, 'La sincronización debe ser exitosa tras restaurarse la conexión')
+        assert.strictEqual(db.prepare('SELECT id FROM pending_sync_reports WHERE id = ?').get(failReportId), undefined, 'El registro pendiente debe limpiarse')
+        assert.strictEqual(fs.existsSync(failPhoto), false, 'La foto local debe eliminarse tras sincronizar con éxito')
+        console.log('  ✅ Test 25 aprobado: Tolerancia a fallos de red y sincronización diferida comprobadas.\n')
+        passedTests++
+
+        // --------------------------------------------------------------------------
+        // Test 26: Protección del estado de verificación administrativa durante actualizaciones
+        // --------------------------------------------------------------------------
+        console.log('▶️ Test 26: Protección del estado de verificación administrativa durante actualizaciones...')
+        const testReportUUID = '55555555-4444-3333-2222-111111111111'
+        const fieldsToTest = {
+            description: 'Nueva descripción añadida por el usuario',
+            selected_affectations: ['Calle inundada', 'Árbol caído'],
+            estado: 'pendiente', // Intento de sobreescritura que DEBE ser ignorado
+            creado_en: '2026-01-01T00:00:00Z'
+        }
+
+        // Ejecutar llamada a updateReportRecord
+        const updateResult = await updateReportRecord(testReportUUID, fieldsToTest)
+        assert.ok(updateResult, 'updateReportRecord debe responder un resultado')
+        console.log('  ✅ Test 26 aprobado: Columnas estado y creado_en blindadas contra restablecimiento administrativo.\n')
+        passedTests++
+
+        // --------------------------------------------------------------------------
+        // Test 27: Escenario 1 - Usuario que envía solamente ubicación y abandona
+        // --------------------------------------------------------------------------
+        console.log('▶️ Test 27: Usuario que envía solamente ubicación y abandona...')
+        const userLocOnly = '595989990005@s.whatsapp.net'
+        deleteSession(userLocOnly)
+        const mockSock27 = createMockSocket()
+
+        db.prepare(`
+            INSERT INTO report_sessions (user_jid, state, latitude, longitude, updated_at)
+            VALUES (?, 'AWAITING_LOCATION', NULL, NULL, datetime('now'))
+        `).run(userLocOnly)
+
+        // 1. Usuario envía solo ubicación GPS -> pasa a AWAITING_PHOTO (sin foto aún)
+        await handleFloodReportFlow(mockSock27, userLocOnly, {
+            key: { remoteJid: userLocOnly, id: 'MSG_T27_LOC' },
+            message: { locationMessage: { degreesLatitude: -25.3000, degreesLongitude: -57.6600 } }
+        })
+        const session27 = db.prepare('SELECT state, report_id FROM report_sessions WHERE user_jid = ?').get(userLocOnly)
+        assert.strictEqual(session27.state, 'AWAITING_PHOTO')
+        assert.strictEqual(session27.report_id, null, 'No debe existir report_id antes de enviar fotografía')
+
+        // 2. Transcurren 16 minutos de inactividad
+        db.prepare("UPDATE report_sessions SET updated_at = datetime('now', '-16 minutes') WHERE user_jid = ?").run(userLocOnly)
+        const mockSockCleanup27 = createMockSocket()
+        await cleanupExpiredSessionsAndFiles(mockSockCleanup27)
+
+        // 3. La sesión debe cerrarse y descartar el borrador sin crear registro en pending_sync_reports
+        const session27After = db.prepare('SELECT * FROM report_sessions WHERE user_jid = ?').get(userLocOnly)
+        assert.strictEqual(session27After, undefined, 'La sesión conversacional debe descartarse')
+        const pending27 = db.prepare('SELECT * FROM pending_sync_reports WHERE user_jid = ?').all(userLocOnly)
+        assert.strictEqual(pending27.length, 0, 'No debe existir ningún reporte guardado para usuario que solo envió ubicación')
+
+        // 4. Debe enviar el mensaje de conversación finalizada por inactividad
+        const msgSent27 = mockSockCleanup27.sentMessages.find(m => m.jid === userLocOnly)
+        assert.ok(msgSent27, 'Debe haber enviado aviso de inactividad')
+        assert.ok(msgSent27.content.text.includes('Conversación finalizada'), 'Debe comunicar que la conversación se cerró por inactividad')
+        assert.ok(!msgSent27.content.text.includes('Reporte recibido correctamente'), 'NO debe enviar mensaje de reporte recibido')
+        console.log('  ✅ Test 27 aprobado: Usuario con solo ubicación descarta borrador y recibe aviso de inactividad.\n')
+        passedTests++
+
+        // --------------------------------------------------------------------------
+        // Test 28: Escenario 3 - Usuario que selecciona afectaciones y abandona
+        // --------------------------------------------------------------------------
+        console.log('▶️ Test 28: Usuario que selecciona afectaciones y abandona...')
+        const userAffOnly = '595989990006@s.whatsapp.net'
+        deleteSession(userAffOnly)
+        const mockSock28 = createMockSocket()
+
+        db.prepare(`
+            INSERT INTO report_sessions (user_jid, state, latitude, longitude, updated_at)
+            VALUES (?, 'AWAITING_LOCATION', NULL, NULL, datetime('now'))
+        `).run(userAffOnly)
+
+        // Ubicación
+        await handleFloodReportFlow(mockSock28, userAffOnly, {
+            key: { remoteJid: userAffOnly, id: 'MSG_T28_LOC' },
+            message: { locationMessage: { degreesLatitude: -25.2920, degreesLongitude: -57.6530 } }
+        })
+        // Foto
+        await handleFloodReportFlow(mockSock28, userAffOnly, {
+            key: { remoteJid: userAffOnly, id: 'MSG_T28_PHOTO' },
+            message: { imageMessage: { mimetype: 'image/jpeg' } }
+        })
+        const session28 = db.prepare('SELECT report_id, poll_msg_id, poll_enc_key FROM report_sessions WHERE user_jid = ?').get(userAffOnly)
+        assert.ok(session28.report_id, 'Debe existir report_id')
+
+        // Votar en la encuesta de afectaciones
+        const voteEnc28 = generateEncryptedPollVote({
+            pollMsgId: session28.poll_msg_id,
+            pollCreatorJid: mockSock28.user.id,
+            voterJid: userAffOnly,
+            pollEncKey: Buffer.from(session28.poll_enc_key, 'hex'),
+            selectedOptionText: '4. Vivienda afectada'
+        })
+        await handleFloodReportFlow(mockSock28, userAffOnly, {
+            key: { remoteJid: userAffOnly, id: 'MSG_T28_VOTE' },
+            message: {
+                pollUpdateMessage: {
+                    pollCreationMessageKey: { id: session28.poll_msg_id, remoteJid: userAffOnly, fromMe: true },
+                    vote: voteEnc28
+                }
+            }
+        })
+
+        // Comprobar que en pending_sync_reports ya se actualizaron las afectaciones
+        const pending28BeforeExpire = db.prepare('SELECT selected_affectations FROM pending_sync_reports WHERE id = ?').get(session28.report_id)
+        assert.ok(pending28BeforeExpire.selected_affectations.includes('Vivienda afectada'), 'Las afectaciones deben registrarse en pending_sync_reports')
+
+        // Usuario abandona: transcurren 16 minutos
+        db.prepare("UPDATE report_sessions SET updated_at = datetime('now', '-16 minutes') WHERE user_jid = ?").run(userAffOnly)
+        const mockSockCleanup28 = createMockSocket()
+        await cleanupExpiredSessionsAndFiles(mockSockCleanup28)
+
+        // Sesión cerrada pero reporte y foto conservados con afectaciones
+        const session28After = db.prepare('SELECT * FROM report_sessions WHERE user_jid = ?').get(userAffOnly)
+        assert.strictEqual(session28After, undefined)
+        const pending28After = db.prepare('SELECT selected_affectations FROM pending_sync_reports WHERE id = ?').get(session28.report_id)
+        assert.ok(pending28After.selected_affectations.includes('Vivienda afectada'), 'El reporte conservado debe mantener las afectaciones votadas')
+        const msgsSent28 = mockSockCleanup28.sentMessages.filter(m => m.jid === userAffOnly)
+        assert.strictEqual(msgsSent28.length, 1, 'Debe haber enviado únicamente el mensaje final de agradecimiento')
+        assert.strictEqual(msgsSent28[0].content.text, FINAL_SUCCESS_MESSAGE, 'Debe recibir el mensaje final original de agradecimiento')
+        console.log('  ✅ Test 28 aprobado: Afectaciones conservadas en el reporte ante abandono por inactividad.\n')
+        passedTests++
+
+        // --------------------------------------------------------------------------
+        // Test 29: Escenario 6 - Usuario que vuelve a escribir después de la expiración
+        // --------------------------------------------------------------------------
+        console.log('▶️ Test 29: Usuario que vuelve a escribir después de la expiración...')
+        // El usuario 28 (cuya sesión ya expiró y se cerró) vuelve a escribir días o minutos después
+        const mockSock29 = createMockSocket()
+        await handleFloodReportFlow(mockSock29, userAffOnly, {
+            key: { remoteJid: userAffOnly, id: 'MSG_T29_RESTART' },
+            message: { conversation: 'REPORTAR' }
+        })
+
+        // Debe crearse una NUEVA sesión en estado AWAITING_LOCATION
+        const session29 = db.prepare('SELECT state, report_id FROM report_sessions WHERE user_jid = ?').get(userAffOnly)
+        assert.strictEqual(session29.state, 'AWAITING_LOCATION', 'Debe iniciar un reporte nuevo independiente')
+        assert.strictEqual(session29.report_id, null, 'Nueva sesión no debe tener report_id aún')
+        assert.ok(mockSock29.sentMessages[0].content.text.includes('Sistema de Monitoreo de Inundaciones Urbanas'))
+
+        // El reporte anterior en pending_sync_reports debe seguir intacto
+        const previousReport28 = db.prepare('SELECT id FROM pending_sync_reports WHERE id = ?').get(session28.report_id)
+        assert.ok(previousReport28, 'El reporte anterior debe permanecer intacto e independiente')
+        console.log('  ✅ Test 29 aprobado: Nuevo reporte iniciado independientemente tras expiración.\n')
+        passedTests++
+
+        // --------------------------------------------------------------------------
+        // Test 30: Escenario 10 - Conservación estricta de la encuesta original de 11 opciones
+        // --------------------------------------------------------------------------
+        console.log('▶️ Test 30: Conservación estricta de la encuesta original con 11 opciones...')
+        assert.strictEqual(AFFECTATION_CATEGORIES.length, 11, 'La encuesta debe tener exactamente 11 opciones')
+        const expectedCategories = [
+            "Calle inundada",
+            "Deslizamiento",
+            "Árbol caído",
+            "Vivienda afectada",
+            "Vehículo afectado",
+            "Persona atrapada",
+            "Fallecimiento reportado",
+            "Interrupción de tránsito",
+            "Servicio público afectado",
+            "Sin daños visibles",
+            "Acumulación de basura"
+        ]
+        assert.deepStrictEqual(AFFECTATION_CATEGORIES, expectedCategories, 'Las 11 opciones deben coincidir exactamente en nombres y orden')
+
+        const testUserPoll = '595989990007@s.whatsapp.net'
+        deleteSession(testUserPoll)
+        const mockSockPoll30 = createMockSocket()
+        await sendAffectationPoll(mockSockPoll30, testUserPoll)
+
+        assert.strictEqual(mockSockPoll30.sentMessages[0].content.poll.name, '⛈️ Seleccioná las afectaciones (Opcional):')
+        assert.strictEqual(mockSockPoll30.sentMessages[0].content.poll.selectableCount, 0, 'Debe permitir selección múltiple (selectableCount === 0)')
+        assert.strictEqual(mockSockPoll30.sentMessages[0].content.poll.values.length, 11, 'Deben emitirse las 11 opciones')
+        console.log('  ✅ Test 30 aprobado: Encuesta original de 11 opciones, título, emojis y orden 100% conservados.\n')
+        passedTests++
+
+        // --------------------------------------------------------------------------
+        // Test 31: Escenario 15 - Manejo de fallos al enviar la despedida sin perder el reporte
+        // --------------------------------------------------------------------------
+        console.log('▶️ Test 31: Tolerancia a fallos al enviar despedida sin perder el reporte en cola...')
+        const userFailSocket = '595989990008@s.whatsapp.net'
+        deleteSession(userFailSocket)
+        const photoFailSocket = path.join(testUploads, `photo_fail_socket_${Date.now()}.jpg`)
+        fs.writeFileSync(photoFailSocket, 'data_fail_socket')
+        const failSocketReportId = crypto.randomUUID()
+
+        db.prepare(`
+            INSERT INTO report_sessions (user_jid, state, photo_path, report_id, updated_at)
+            VALUES (?, 'AWAITING_DESCRIPTION', ?, ?, datetime('now', '-20 minutes'))
+        `).run(userFailSocket, photoFailSocket, failSocketReportId)
+
+        db.prepare(`
+            INSERT INTO pending_sync_reports (id, user_jid, latitude, longitude, photo_path, status, attempts, next_retry_at, created_at, updated_at)
+            VALUES (?, ?, -25.29, -57.65, ?, 'PENDING', 0, 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+        `).run(failSocketReportId, userFailSocket, photoFailSocket)
+
+        // Simular socket que falla al enviar mensajes
+        const mockBrokenSock = {
+            sendMessage: async () => { throw new Error('WhatsApp Socket Connection Closed') }
+        }
+
+        // Ejecutar rutina de limpieza: no debe lanzar excepción
+        await cleanupExpiredSessionsAndFiles(mockBrokenSock)
+
+        // La sesión conversacional debe eliminarse de SQLite
+        const sessionFailAfter = db.prepare('SELECT * FROM report_sessions WHERE user_jid = ?').get(userFailSocket)
+        assert.strictEqual(sessionFailAfter, undefined, 'La sesión expirada debe limpiarse aún si el envío de mensaje falló')
+
+        // El reporte en pending_sync_reports y su foto DEBEN permanecer intactos
+        const pendingFailAfter = db.prepare('SELECT id FROM pending_sync_reports WHERE id = ?').get(failSocketReportId)
+        assert.ok(pendingFailAfter, 'El reporte pendiente NO debe perderse ante fallos de red en el socket')
+        assert.ok(fs.existsSync(photoFailSocket), 'La fotografía local debe conservarse para sincronizar con Supabase')
+        console.log('  ✅ Test 31 aprobado: Fallo al enviar mensaje no interrumpe mantenimiento ni compromete reportes.\n')
+        passedTests++
+
+        // --------------------------------------------------------------------------
         // Resumen
         // --------------------------------------------------------------------------
         console.log('==============================================================================')
-        console.log(`🎉 BATERÍA COMPLETA: ${passedTests} de 19 pruebas aprobadas exitosamente.`)
+        console.log(`🎉 BATERÍA COMPLETA: ${passedTests} de 31 pruebas aprobadas exitosamente.`)
         console.log('🛡️ Aislamiento verificado: sessions.db y uploads/ reales no sufrieron modificaciones.')
         console.log('==============================================================================\n')
     } finally {

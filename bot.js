@@ -34,6 +34,8 @@ const {
 const {
     uploadReportPhoto,
     insertReportRecord,
+    updateReportRecord,
+    deleteReportRecord,
     syncReportToSupabase,
     isSupabaseConfigured
 } = require('./supabaseClient')
@@ -68,7 +70,8 @@ const UPLOADS_DIR = process.env.UPLOADS_DIR || path.resolve(__dirname, 'uploads'
 const DB_PATH = process.env.DB_PATH || path.resolve(__dirname, 'sessions.db')
 
 // Tiempo máximo de inactividad por usuario (30 minutos en milisegundos)
-const SESSION_TIMEOUT_MS = 30 * 60 * 1000
+const SESSION_TIMEOUT_MS = 15 * 60 * 1000
+const FINAL_SUCCESS_MESSAGE = `✅ *¡Reporte recibido correctamente!*\n\n¡Muchas gracias por tu colaboración! 🙌\n\nTu reporte contribuirá al monitoreo de inundaciones urbanas y a la identificación de zonas afectadas.\n\n🗺️ *¡Explorá nuestro mapa interactivo!*\n\nPodés visualizar los reportes de inundaciones en nuestra plataforma web:\n\n🔗 https://monitoreoinundaciones.vercel.app`
 
 if (!fs.existsSync(UPLOADS_DIR)) {
     fs.mkdirSync(UPLOADS_DIR, { recursive: true })
@@ -87,6 +90,8 @@ db.exec(`
         description TEXT,
         poll_msg_id TEXT,
         poll_enc_key TEXT,
+        report_id TEXT,
+        storage_url TEXT,
         updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
     );
 
@@ -114,6 +119,14 @@ db.exec(`
         message TEXT NOT NULL
     );
 `)
+
+// Migraciones seguras para bases de datos existentes
+try {
+    db.prepare('ALTER TABLE report_sessions ADD COLUMN report_id TEXT').run()
+} catch (_) { }
+try {
+    db.prepare('ALTER TABLE report_sessions ADD COLUMN storage_url TEXT').run()
+} catch (_) { }
 
 // Helper de logging local
 function addLog(type, message) {
@@ -197,11 +210,12 @@ function deleteSessionWithoutPhoto(userJid) {
     }
 }
 
-// Elimina la sesión en SQLite y su foto temporal asociada (si existe) de forma segura
+// Elimina la sesión en SQLite y, si es un borrador previo al guardado automático, elimina su foto temporal
 function deleteSession(userJid) {
     try {
-        const current = db.prepare('SELECT photo_path FROM report_sessions WHERE user_jid = ?').get(userJid)
-        if (current?.photo_path) {
+        const current = db.prepare('SELECT photo_path, report_id FROM report_sessions WHERE user_jid = ?').get(userJid)
+        // Solo eliminar foto si NO pertenece a un reporte ya registrado
+        if (current?.photo_path && !current?.report_id) {
             safeDeleteUploadFile(current.photo_path)
         }
         db.prepare('DELETE FROM report_sessions WHERE user_jid = ?').run(userJid)
@@ -210,21 +224,46 @@ function deleteSession(userJid) {
     }
 }
 
-// Limpieza periódica y al inicio: elimina sesiones expiradas (>30 min) y fotos huérfanas en uploads/
-function cleanupExpiredSessionsAndFiles() {
+// Limpieza periódica y al inicio: elimina sesiones expiradas (>15 min) y fotos huérfanas en uploads/
+async function cleanupExpiredSessionsAndFiles(customSock = null) {
+    const sock = customSock || global.activeSock || defaultQueue.getSocket()
     try {
         const activePhotoPaths = new Set()
         let expiredCount = 0
 
         // 1. Sesiones de conversación activas
-        const allSessions = db.prepare('SELECT user_jid, photo_path, updated_at FROM report_sessions').all()
+        const allSessions = db.prepare('SELECT user_jid, photo_path, report_id, updated_at FROM report_sessions').all()
         for (const s of allSessions) {
             if (isSessionExpired(s)) {
-                if (s.photo_path) {
-                    safeDeleteUploadFile(s.photo_path)
-                }
+                // Eliminar sesión conversacional de inmediato para que nunca se procese dos veces
                 db.prepare('DELETE FROM report_sessions WHERE user_jid = ?').run(s.user_jid)
                 expiredCount++
+
+                if (s.report_id) {
+                    // Reporte registrado con ubicación y fotografía: conservar reporte y foto
+                    addLog('info', `⏰ Sesión expirada para ${s.user_jid}. Reporte ${s.report_id} conservado en cola/Supabase.`)
+                    if (sock) {
+                        try {
+                            await sendQueuedMessage(sock, s.user_jid, { text: FINAL_SUCCESS_MESSAGE })
+                        } catch (sendErr) {
+                            addLog('warn', `No se pudo enviar mensaje de expiración a ${s.user_jid}: ${sendErr.message}`)
+                        }
+                    }
+                } else {
+                    // Borrador incompleto (no llegó a foto válida): descartar
+                    if (s.photo_path) {
+                        safeDeleteUploadFile(s.photo_path)
+                    }
+                    addLog('info', `⏰ Borrador incompleto expirado para ${s.user_jid}. Sesión descartada.`)
+                    if (sock) {
+                        const draftExpireMsg = `⏱️ *Conversación finalizada*\n\nLa conversación se cerró por inactividad.\n\nSi querés realizar un reporte, podés volver a escribir *REPORTAR* cuando quieras.`
+                        try {
+                            await sendQueuedMessage(sock, s.user_jid, { text: draftExpireMsg })
+                        } catch (sendErr) {
+                            addLog('warn', `No se pudo enviar mensaje de expiración a ${s.user_jid}: ${sendErr.message}`)
+                        }
+                    }
+                }
             } else if (s.photo_path) {
                 // Sesión activa: registrar su fotografía para que NUNCA sea eliminada
                 try {
@@ -234,10 +273,10 @@ function cleanupExpiredSessionsAndFiles() {
         }
 
         if (expiredCount > 0) {
-            addLog('info', `🧹 Limpieza: ${expiredCount} sesión(es) expirada(s) eliminada(s) por inactividad.`)
+            addLog('info', `🧹 Limpieza: ${expiredCount} sesión(es) expirada(s) procesada(s) por inactividad.`)
         }
 
-        // 2. Reportes confirmados pendientes de sincronización (NUNCA deben eliminarse sus fotos)
+        // 2. Reportes confirmados / auto-guardados pendientes de sincronización (NUNCA deben eliminarse sus fotos)
         try {
             const pendingReports = db.prepare('SELECT photo_path FROM pending_sync_reports WHERE photo_path IS NOT NULL').all()
             for (const p of pendingReports) {
@@ -258,7 +297,7 @@ function cleanupExpiredSessionsAndFiles() {
                 if (!activePhotoPaths.has(fullPath)) {
                     try {
                         const stat = fs.statSync(fullPath)
-                        // Si está huérfana y tiene más de 30 minutos de antigüedad (margen de seguridad)
+                        // Si está huérfana y tiene más de 15 minutos de antigüedad (margen de seguridad)
                         if (now - stat.mtimeMs >= SESSION_TIMEOUT_MS) {
                             safeDeleteUploadFile(fullPath)
                         }
@@ -285,6 +324,7 @@ async function processSinglePendingReport(report, customSyncDependencies = null)
 
     const uploadPhotoFn = customSyncDependencies?.uploadReportPhoto || uploadReportPhoto
     const insertRecordFn = customSyncDependencies?.insertReportRecord || insertReportRecord
+    const updateRecordFn = customSyncDependencies?.updateReportRecord || updateReportRecord
     const isConfiguredFn = customSyncDependencies?.isSupabaseConfigured || isSupabaseConfigured
 
     if (!isConfiguredFn()) {
@@ -293,6 +333,40 @@ async function processSinglePendingReport(report, customSyncDependencies = null)
     }
 
     try {
+        // CASO ESPECIAL: Actualización diferida de reporte ya insertado en Supabase
+        // (preserva intacto el estado de verificación 'estado' y 'creado_en')
+        if (report.status === 'PENDING_UPDATE') {
+            const updateRes = await updateRecordFn(report.id, {
+                description: report.description,
+                selected_affectations: report.selected_affectations
+            })
+
+            if (!updateRes || !updateRes.success) {
+                const updateErr = updateRes?.error || 'Fallo al actualizar en base de datos'
+                const nextAttempts = (report.attempts || 0) + 1
+                const nextRetry = Date.now() + getNextRetryDelayMs(nextAttempts)
+                db.prepare(`
+                    UPDATE pending_sync_reports
+                    SET attempts = ?,
+                        last_error = ?,
+                        next_retry_at = ?,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                `).run(nextAttempts, `DB Update: ${updateErr}`, nextRetry, report.id)
+                addLog('warn', `⚠️ Fallo al actualizar reporte ${report.id} en DB (Intento ${nextAttempts}): ${updateErr}`)
+                return { success: false, error: updateErr }
+            }
+
+            addLog('info', `☁️ Reporte ${report.id} actualizado exitosamente en Supabase DB`)
+            db.prepare('DELETE FROM pending_sync_reports WHERE id = ?').run(report.id)
+            return {
+                success: true,
+                reportId: report.id,
+                isUpdate: true,
+                remoteData: updateRes.data
+            }
+        }
+
         let photoPublicUrl = report.storage_url || null
 
         // Comprobación de existencia del archivo local
@@ -310,6 +384,9 @@ async function processSinglePendingReport(report, customSyncDependencies = null)
                         SET storage_url = ?, updated_at = CURRENT_TIMESTAMP
                         WHERE id = ?
                     `).run(photoPublicUrl, report.id)
+                    try {
+                        db.prepare('UPDATE report_sessions SET storage_url = ? WHERE report_id = ?').run(photoPublicUrl, report.id)
+                    } catch (_) {}
                     addLog('info', `📸 Foto de reporte ${report.id} subida a Storage: ${photoPublicUrl}`)
                 } else {
                     const uploadErr = uploadRes?.error || 'Fallo al subir a Storage'
@@ -421,6 +498,69 @@ async function processSinglePendingReport(report, customSyncDependencies = null)
     }
 }
 
+// Helper para sincronizar progresivamente los cambios de afectaciones y descripción
+async function updateSavedReportData(sender, customDependencies = null) {
+    try {
+        const session = db.prepare('SELECT report_id, latitude, longitude, selected_affectations, description, storage_url FROM report_sessions WHERE user_jid = ?').get(sender)
+        if (!session || !session.report_id) return
+
+        const pending = db.prepare('SELECT id, status, storage_url FROM pending_sync_reports WHERE id = ?').get(session.report_id)
+
+        if (pending) {
+            // El reporte aún reside en la cola de sincronización pendiente:
+            // actualizar directamente la fila para que el envío lleve la información más reciente
+            db.prepare(`
+                UPDATE pending_sync_reports
+                SET selected_affectations = ?,
+                    description = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+            `).run(
+                session.selected_affectations || '[]',
+                session.description || 'Sin descripción',
+                session.report_id
+            )
+            addLog('info', `Datos consolidados en cola pendiente para reporte ${session.report_id}`)
+        } else {
+            // El reporte básico inicial ya fue insertado en Supabase: actualizar remotamente
+            // sin tocar las columnas 'estado' ni 'creado_en'
+            const updateRecordFn = customDependencies?.updateReportRecord || updateReportRecord
+            const updateRes = await updateRecordFn(session.report_id, {
+                description: session.description,
+                selected_affectations: session.selected_affectations
+            })
+
+            if (!updateRes || !updateRes.success) {
+                // Si la actualización inmediata falla (ej: fallo de red temporal), encolar en pending_sync_reports con status PENDING_UPDATE
+                const errDetail = updateRes?.error || 'Fallo de actualización remota'
+                addLog('warn', `No se pudo actualizar de inmediato en Supabase (${errDetail}). Encolando en pending_sync_reports para reintento: ${session.report_id}`)
+                db.prepare(`
+                    INSERT INTO pending_sync_reports (
+                        id, user_jid, latitude, longitude, selected_affectations, photo_path, description, storage_url, status, attempts, next_retry_at, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, NULL, ?, ?, 'PENDING_UPDATE', 0, 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                    ON CONFLICT(id) DO UPDATE SET
+                        selected_affectations = excluded.selected_affectations,
+                        description = excluded.description,
+                        status = 'PENDING_UPDATE',
+                        updated_at = CURRENT_TIMESTAMP
+                `).run(
+                    session.report_id,
+                    sender,
+                    session.latitude,
+                    session.longitude,
+                    session.selected_affectations || '[]',
+                    session.description || 'Sin descripción',
+                    session.storage_url || null
+                )
+            } else {
+                addLog('info', `Reporte ${session.report_id} actualizado exitosamente en Supabase`)
+            }
+        }
+    } catch (err) {
+        addLog('error', `Error al actualizar datos de reporte guardado para ${sender}: ${err.message}`)
+    }
+}
+
 // Orquestador para sincronizar reportes pendientes listos para reintento
 let isSyncingPendingReports = false
 async function triggerSyncPendingReports(customDependencies = null) {
@@ -432,7 +572,7 @@ async function triggerSyncPendingReports(customDependencies = null) {
         const pendingReports = db.prepare(`
             SELECT id, user_jid, latitude, longitude, selected_affectations, photo_path, description, storage_url, status, attempts, next_retry_at
             FROM pending_sync_reports
-            WHERE status = 'PENDING' AND next_retry_at <= ?
+            WHERE status IN ('PENDING', 'PENDING_UPDATE') AND next_retry_at <= ?
             ORDER BY created_at ASC
             LIMIT 10
         `).all(nowMs)
@@ -495,14 +635,14 @@ const CONFIRMATION_INTERFACE_MODE = 'POLL'
 // Registro en memoria de encuestas activas para asociar ID con su clave de descifrado y tipo
 if (!global.pollRegistry) global.pollRegistry = new Map()
 
-// Envío de interfaz de confirmación de reporte (resumen + encuesta táctil o texto clásico)
-async function sendReportConfirmationInterface(sock, sender, currentSession, modeOverride = null) {
-    const mode = modeOverride || CONFIRMATION_INTERFACE_MODE
-
+// Genera el texto del resumen del reporte
+function getReportSummaryText(currentSession) {
     let affectationsList = []
     try {
         if (currentSession?.selected_affectations) {
-            affectationsList = JSON.parse(currentSession.selected_affectations)
+            affectationsList = typeof currentSession.selected_affectations === 'string'
+                ? JSON.parse(currentSession.selected_affectations)
+                : currentSession.selected_affectations
         }
     } catch (_) { }
 
@@ -510,7 +650,7 @@ async function sendReportConfirmationInterface(sock, sender, currentSession, mod
         ? affectationsList.join(', ')
         : 'Ninguna'
 
-    const descStr = currentSession?.description && currentSession.description.trim().length > 0
+    const descStr = currentSession?.description && currentSession.description.trim().length > 0 && currentSession.description.trim() !== 'Sin descripción'
         ? currentSession.description.trim()
         : 'No proporcionada'
 
@@ -518,11 +658,17 @@ async function sendReportConfirmationInterface(sock, sender, currentSession, mod
         ? `${currentSession.latitude.toFixed(6)}, ${currentSession.longitude.toFixed(6)}`
         : 'No registrada'
 
-    const summaryText = `📋 *Resumen de tu reporte*\n\n` +
+    return `📋 *Resumen de tu reporte*\n\n` +
         `📍 *Ubicación:* ${coordsStr}\n` +
         `📸 *Fotografía:* Recibida ✅\n` +
         `⛈️ *Afectaciones:* ${affectationsStr}\n` +
         `✍️ *Descripción:* ${descStr}`
+}
+
+// Envío de interfaz de confirmación de reporte (resumen + encuesta táctil o texto clásico)
+async function sendReportConfirmationInterface(sock, sender, currentSession, modeOverride = null) {
+    const mode = modeOverride || CONFIRMATION_INTERFACE_MODE
+    const summaryText = getReportSummaryText(currentSession)
 
     if (mode === 'POLL') {
         try {
@@ -568,52 +714,56 @@ async function sendReportConfirmationInterface(sock, sender, currentSession, mod
     return sent
 }
 
-// Ejecución segura de confirmación de reporte y registro en cola local de sincronización
-async function executeReportConfirmation(sock, sender, session) {
-    const confirmedSession = db.prepare('SELECT latitude, longitude, selected_affectations, photo_path, description FROM report_sessions WHERE user_jid = ?').get(sender) || session
+// Ejecución segura de confirmación de reporte y consolidación de datos
+async function executeReportConfirmation(sock, sender, session, customDependencies = null) {
+    const confirmedSession = db.prepare('SELECT latitude, longitude, selected_affectations, photo_path, description, report_id, storage_url FROM report_sessions WHERE user_jid = ?').get(sender) || session
 
     // Validar coordenadas obligatorias
     if (confirmedSession.latitude == null || confirmedSession.longitude == null) {
         const invalidCoordsMsg = `No se detectaron coordenadas válidas para este reporte. Escribí *REPORTAR* para iniciar un reporte nuevo.`
-        deleteSession(sender)
+        deleteSession(sender, customDependencies)
         await sendQueuedMessage(sock, sender, { text: invalidCoordsMsg })
         return true
     }
 
-    const reportId = crypto.randomUUID()
-
-    // 1. Guardar primero en pending_sync_reports
-    try {
-        db.prepare(`
-            INSERT INTO pending_sync_reports (
-                id, user_jid, latitude, longitude, selected_affectations, photo_path, description, status, attempts, next_retry_at, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'PENDING', 0, 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-        `).run(
-            reportId,
-            sender,
-            confirmedSession.latitude,
-            confirmedSession.longitude,
-            confirmedSession.selected_affectations || '[]',
-            confirmedSession.photo_path || null,
-            confirmedSession.description || null
-        )
-    } catch (err) {
-        addLog('error', `Fallo al registrar reporte en pending_sync_reports para ${sender}: ${err.message}`)
-        const dbFailMsg = `⚠️ Ocurrió un error al registrar tu reporte localmente. Por favor respondé *1* para intentar confirmar nuevamente.`
-        await sendQueuedMessage(sock, sender, { text: dbFailMsg })
-        return true
+    let reportId = confirmedSession.report_id
+    if (!reportId) {
+        // Fallback para sesiones existentes que no hayan pasado por la auto-generación en AWAITING_PHOTO
+        reportId = crypto.randomUUID()
+        try {
+            db.prepare(`
+                INSERT INTO pending_sync_reports (
+                    id, user_jid, latitude, longitude, selected_affectations, photo_path, description, status, attempts, next_retry_at, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'PENDING', 0, 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            `).run(
+                reportId,
+                sender,
+                confirmedSession.latitude,
+                confirmedSession.longitude,
+                confirmedSession.selected_affectations || '[]',
+                confirmedSession.photo_path || null,
+                confirmedSession.description || 'Sin descripción'
+            )
+        } catch (err) {
+            addLog('error', `Fallo al registrar reporte en pending_sync_reports para ${sender}: ${err.message}`)
+            const dbFailMsg = `⚠️ Ocurrió un error al registrar tu reporte localmente. Por favor respondé *1* para intentar confirmar nuevamente.`
+            await sendQueuedMessage(sock, sender, { text: dbFailMsg })
+            return true
+        }
+    } else {
+        // Consolidar la actualización final en la cola / Supabase
+        await updateSavedReportData(sender, customDependencies)
     }
 
     // 2. Solo tras guardar exitosamente en SQLite, cerrar la sesión conversacional SIN borrar la foto
     deleteSessionWithoutPhoto(sender)
 
     // 3. Enviar confirmación al usuario
-    const finalMsg = `✅ *¡Reporte recibido correctamente!*\n\n¡Muchas gracias por tu colaboración! 🙌\n\nTu reporte contribuirá al monitoreo de inundaciones urbanas y a la identificación de zonas afectadas.\n\n🗺️ *¡Explorá nuestro mapa interactivo!*\n\nPodés visualizar los reportes de inundaciones en nuestra plataforma web:\n\n🔗 https://mapa-chi-steel.vercel.app/`
-    await sendQueuedMessage(sock, sender, { text: finalMsg })
-    addLog('message_out', `Reporte confirmado por ${sender} (ID pendiente: ${reportId}). Sesión cerrada.`)
+    await sendQueuedMessage(sock, sender, { text: FINAL_SUCCESS_MESSAGE })
+    addLog('message_out', `Reporte confirmado por ${sender} (ID: ${reportId}). Sesión cerrada.`)
 
     // 4. Disparar sincronización asíncrona hacia Supabase (no bloquea al usuario)
-    triggerSyncPendingReports().catch(syncErr => {
+    triggerSyncPendingReports(customDependencies).catch(syncErr => {
         addLog('error', `⚠️ Error al activar sincronización asíncrona: ${syncErr.message}`)
     })
 
@@ -703,7 +853,7 @@ async function handleFloodReportFlow(sock, sender, msg) {
     // Debounce para evitar ráfagas repetidas
     if (!global.recentTriggers) global.recentTriggers = new Map()
 
-    const session = db.prepare('SELECT state, latitude, longitude, selected_affectations, photo_path, description, poll_msg_id, poll_enc_key, updated_at FROM report_sessions WHERE user_jid = ?').get(sender)
+    const session = db.prepare('SELECT state, latitude, longitude, selected_affectations, photo_path, description, poll_msg_id, poll_enc_key, report_id, storage_url, updated_at FROM report_sessions WHERE user_jid = ?').get(sender)
 
     // Helper para iniciar un reporte nuevo
     const startNewReport = async () => {
@@ -712,9 +862,9 @@ async function handleFloodReportFlow(sock, sender, msg) {
         if (now - lastTrigger < 3000) return true
         global.recentTriggers.set(sender, now)
 
-        // Limpieza de foto temporal anterior si existía en una sesión previa no confirmada
-        const prevSession = db.prepare('SELECT photo_path FROM report_sessions WHERE user_jid = ?').get(sender)
-        if (prevSession?.photo_path) {
+        // Limpieza de foto temporal anterior solo si existía en una sesión previa no auto-guardada
+        const prevSession = db.prepare('SELECT photo_path, report_id FROM report_sessions WHERE user_jid = ?').get(sender)
+        if (prevSession?.photo_path && !prevSession?.report_id) {
             safeDeleteUploadFile(prevSession.photo_path)
         }
 
@@ -730,12 +880,14 @@ async function handleFloodReportFlow(sock, sender, msg) {
                 description = NULL,
                 poll_msg_id = NULL,
                 poll_enc_key = NULL,
+                report_id = NULL,
+                storage_url = NULL,
                 updated_at = CURRENT_TIMESTAMP
         `).run(sender)
 
         const welcomeMsg = `⛈️ *Sistema de Monitoreo de Inundaciones Urbanas* ⛈️\n\n¡Hola! 👋\n\nEste sistema busca recopilar información sobre inundaciones urbanas mediante la participación ciudadana. Tu reporte ayudará a identificar las zonas afectadas y mejorar el conocimiento sobre estos eventos.\n\nPara registrar tu reporte, te pediremos la siguiente información:\n\n📍 *Ubicación:* lugar donde ocurre la inundación.\n\n📸 *Fotografía:* imagen del lugar afectado.\n\n⛈️ *Afectaciones:* situaciones o daños observados.\n\n✍️ *Descripción (opcional):* información adicional sobre lo ocurrido.\n\nTu participación nos ayuda a identificar y conocer mejor las zonas afectadas por inundaciones.`
 
-        const locationPrompt = `📍 *Paso 1: Ubicación*\n\nPor favor, compartí la ubicación del lugar donde está ocurriendo la inundación.\n\nPodés enviar tu ubicación actual o seleccionar otro punto en el mapa.`
+        const locationPrompt = `📍 *Paso 1: Ubicación*\n\nPor favor, compartí la ubicación del lugar donde está ocurriendo la inundación.\n\nPodés enviar tu ubicación actual o seleccionar otro punto en el mapa.\n\nPara cancelar el reporte, escribí *0*.`
 
         await sendQueuedMessage(sock, sender, { text: welcomeMsg })
         await sendQueuedMessage(sock, sender, { text: locationPrompt })
@@ -746,11 +898,21 @@ async function handleFloodReportFlow(sock, sender, msg) {
     // Comandos de reinicio manual (Inicio / Reiniciar / Empezar)
     const isRestartCommand = lowerText === 'inicio' || lowerText === 'reiniciar' || lowerText === 'empezar'
 
-    // Comandos de cancelación manual (Cancelar / 0)
-    const isCancelCommand = lowerText === 'cancelar' || text === '0'
+    // Comandos de cancelación manual o salida (Cancelar / 0 / Salir)
+    const isCancelCommand = lowerText === 'cancelar' || text === '0' || lowerText === 'salir'
 
-    // 1. Cancelación global en cualquier momento
+    // 1. Cancelación o salida global en cualquier momento
     if (isCancelCommand) {
+        if (session?.report_id) {
+            const currentSession = db.prepare('SELECT latitude, longitude, selected_affectations, photo_path, description, report_id, storage_url FROM report_sessions WHERE user_jid = ?').get(sender) || session
+            const summaryText = getReportSummaryText(currentSession)
+            await sendQueuedMessage(sock, sender, { text: summaryText })
+            await sendQueuedMessage(sock, sender, { text: FINAL_SUCCESS_MESSAGE })
+            deleteSessionWithoutPhoto(sender)
+            addLog('message_out', `Salida de preguntas opcionales por usuario: ${sender}. Reporte ${session.report_id} conservado.`)
+            return true
+        }
+
         deleteSession(sender)
         const cancelMsg = 'Reporte cancelado. Escribí *REPORTAR* cuando quieras comenzar de nuevo.'
         await sendQueuedMessage(sock, sender, { text: cancelMsg })
@@ -777,17 +939,22 @@ async function handleFloodReportFlow(sock, sender, msg) {
 
     // 3. Expiración por inactividad de 30 minutos:
     // Si pasaron 30 min o más desde la última interacción en UTC, se descarta silenciosamente
-    // la sesión previa (sin mensajes automáticos de expiración) y se reinicia desde la bienvenida.
+    // la sesión previa conversacional (sin mensajes automáticos de expiración) y se reinicia desde la bienvenida.
+    // Si el usuario ya había enviado ubicación y fotografía válida, el reporte básico queda preservado.
     if (isSessionExpired(session)) {
-        addLog('info', `Sesión expirada por inactividad (>30 min) para ${sender}. Reiniciando flujo.`)
-        deleteSession(sender)
+        addLog('info', `Sesión expirada por inactividad (>30 min) para ${sender}. Reiniciando flujo conversacional (reporte preservado si existía).`)
+        if (!session.report_id && session.photo_path) {
+            safeDeleteUploadFile(session.photo_path)
+        }
+        db.prepare('DELETE FROM report_sessions WHERE user_jid = ?').run(sender)
         return await startNewReport()
     }
 
-    // Helper para mostrar resumen antes de confirmar
+    // Helper para mostrar resumen del reporte
     const sendReportSummary = async () => {
-        const currentSession = db.prepare('SELECT latitude, longitude, selected_affectations, photo_path, description FROM report_sessions WHERE user_jid = ?').get(sender)
-        return await sendReportConfirmationInterface(sock, sender, currentSession)
+        const currentSession = db.prepare('SELECT latitude, longitude, selected_affectations, photo_path, description, report_id, storage_url FROM report_sessions WHERE user_jid = ?').get(sender) || session
+        const summaryText = getReportSummaryText(currentSession)
+        return await sendQueuedMessage(sock, sender, { text: summaryText })
     }
 
     // Procesamiento silencioso de votos en encuestas de WhatsApp
@@ -919,6 +1086,7 @@ async function handleFloodReportFlow(sock, sender, msg) {
                                     .run(JSON.stringify(selectedCategories), sender)
 
                                 addLog('info', `Afectaciones actualizadas desde encuesta para ${sender}: ${selectedCategories.join(', ')}`)
+                                await updateSavedReportData(sender)
                             }
                         } else {
                             addLog('warn', `No se pudo descifrar voto de encuesta para ${sender}: ${lastDecryptError?.message || 'Sin opciones'}`)
@@ -949,7 +1117,7 @@ async function handleFloodReportFlow(sock, sender, msg) {
                 WHERE user_jid = ?
             `).run(lat, lng, sender)
 
-            const confirmMsg = `✅ ¡Ubicación recibida con éxito! 📍\nCoordenadas: ${lat.toFixed(6)}, ${lng.toFixed(6)}\n\n📸 *Fotografía del incidente*\n\nPor favor enviá una fotografía del lugar como evidencia para continuar.`
+            const confirmMsg = `✅ ¡Ubicación recibida con éxito! 📍\nCoordenadas: ${lat.toFixed(6)}, ${lng.toFixed(6)}\n\n📸 *Fotografía del incidente*\n\nPor favor enviá una fotografía del lugar como evidencia para continuar.\n\nPara cancelar el reporte, escribí *0*.`
 
             await sendQueuedMessage(sock, sender, { text: confirmMsg })
             addLog('message_out', `Ubicación GPS guardada (${lat}, ${lng}) para ${sender}`)
@@ -980,15 +1148,45 @@ async function handleFloodReportFlow(sock, sender, msg) {
 
                 fs.writeFileSync(filePath, buffer)
 
+                // Persistencia Progresiva Temprana: Ubicación y fotografía ya son válidas.
+                // Generar UUID de inmediato y auto-guardar en cola y Supabase sin esperar confirmación final.
+                const reportId = crypto.randomUUID()
+
                 db.prepare(`
                     UPDATE report_sessions
                     SET state = 'AWAITING_DESCRIPTION',
                         photo_path = ?,
+                        report_id = ?,
+                        storage_url = NULL,
                         updated_at = CURRENT_TIMESTAMP
                     WHERE user_jid = ?
-                `).run(filePath, sender)
+                `).run(filePath, reportId, sender)
 
-                addLog('info', `Fotografía guardada localmente en ${filePath}`)
+                addLog('info', `Fotografía guardada localmente en ${filePath}. Reporte auto-guardado: ${reportId}`)
+
+                // Guardar automáticamente en pending_sync_reports
+                try {
+                    db.prepare(`
+                        INSERT INTO pending_sync_reports (
+                            id, user_jid, latitude, longitude, selected_affectations, photo_path, description, storage_url, status, attempts, next_retry_at, created_at, updated_at
+                        ) VALUES (?, ?, ?, ?, '[]', ?, 'Sin descripción', NULL, 'PENDING', 0, 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                    `).run(
+                        reportId,
+                        sender,
+                        session.latitude,
+                        session.longitude,
+                        filePath
+                    )
+                    addLog('info', `Reporte básico ${reportId} encolado para sincronización inmediata con Supabase.`)
+                } catch (queueErr) {
+                    addLog('error', `Error al encolar reporte básico ${reportId}: ${queueErr.message}`)
+                }
+
+                // Disparar sincronización asíncrona de inmediato (no bloquea al usuario)
+                triggerSyncPendingReports().catch(syncErr => {
+                    addLog('error', `⚠️ Error al activar sincronización temprana: ${syncErr.message}`)
+                })
+
                 await sendAffectationPoll(sock, sender)
                 return true
 
@@ -1008,37 +1206,37 @@ async function handleFloodReportFlow(sock, sender, msg) {
 
     // 4. Estado: AWAITING_AFFECTATIONS_AND_DESC (Compatibilidad con sesiones existentes)
     if (session.state === 'AWAITING_AFFECTATIONS_AND_DESC') {
-        if (text === '0' || lowerText === 'cancelar') {
-            deleteSession(sender)
-            const cancelMsg = 'Reporte cancelado. Escribí *REPORTAR* cuando quieras comenzar de nuevo.'
-            await sendQueuedMessage(sock, sender, { text: cancelMsg })
+        if (text === '0' || lowerText === 'cancelar' || lowerText === 'salir') {
+            await sendReportSummary()
+            await sendQueuedMessage(sock, sender, { text: FINAL_SUCCESS_MESSAGE })
+            deleteSessionWithoutPhoto(sender)
+            addLog('message_out', `Salida de preguntas opcionales por usuario: ${sender}. Reporte ${session.report_id} conservado.`)
             return true
         }
 
         if (text === '1' || lowerText === 'omitir' || lowerText === 'listo' || lowerText === 'continuar') {
-            db.prepare(`
-                UPDATE report_sessions
-                SET state = 'AWAITING_CONFIRMATION',
-                    description = NULL,
-                    updated_at = CURRENT_TIMESTAMP
-                WHERE user_jid = ?
-            `).run(sender)
-
+            await updateSavedReportData(sender)
             await sendReportSummary()
+            await sendQueuedMessage(sock, sender, { text: FINAL_SUCCESS_MESSAGE })
+            deleteSessionWithoutPhoto(sender)
+            addLog('message_out', `Reporte completado (sin descripción) por ${sender}. Sesión cerrada.`)
             return true
         }
 
         if (text.length > 0) {
             db.prepare(`
                 UPDATE report_sessions
-                SET state = 'AWAITING_CONFIRMATION',
-                    description = ?,
+                SET description = ?,
                     updated_at = CURRENT_TIMESTAMP
                 WHERE user_jid = ?
             `).run(text, sender)
 
             addLog('info', `Descripción guardada para ${sender}: ${text}`)
+            await updateSavedReportData(sender)
             await sendReportSummary()
+            await sendQueuedMessage(sock, sender, { text: FINAL_SUCCESS_MESSAGE })
+            deleteSessionWithoutPhoto(sender)
+            addLog('message_out', `Reporte completado con descripción por ${sender}. Sesión cerrada.`)
             return true
         }
 
@@ -1050,37 +1248,37 @@ async function handleFloodReportFlow(sock, sender, msg) {
 
     // 5. Estado: AWAITING_DESCRIPTION (Descripción opcional del incidente)
     if (session.state === 'AWAITING_DESCRIPTION') {
-        if (text === '0' || lowerText === 'cancelar') {
-            deleteSession(sender)
-            const cancelMsg = 'Reporte cancelado. Escribí *REPORTAR* cuando quieras comenzar de nuevo.'
-            await sendQueuedMessage(sock, sender, { text: cancelMsg })
+        if (text === '0' || lowerText === 'cancelar' || lowerText === 'salir') {
+            await sendReportSummary()
+            await sendQueuedMessage(sock, sender, { text: FINAL_SUCCESS_MESSAGE })
+            deleteSessionWithoutPhoto(sender)
+            addLog('message_out', `Salida de preguntas opcionales por usuario: ${sender}. Reporte ${session.report_id} conservado.`)
             return true
         }
 
         if (text === '1' || lowerText === 'omitir' || lowerText === 'listo' || lowerText === 'continuar') {
-            db.prepare(`
-                UPDATE report_sessions
-                SET state = 'AWAITING_CONFIRMATION',
-                    description = NULL,
-                    updated_at = CURRENT_TIMESTAMP
-                WHERE user_jid = ?
-            `).run(sender)
-
+            await updateSavedReportData(sender)
             await sendReportSummary()
+            await sendQueuedMessage(sock, sender, { text: FINAL_SUCCESS_MESSAGE })
+            deleteSessionWithoutPhoto(sender)
+            addLog('message_out', `Reporte completado (sin descripción) por ${sender}. Sesión cerrada.`)
             return true
         }
 
         if (text.length > 0) {
             db.prepare(`
                 UPDATE report_sessions
-                SET state = 'AWAITING_CONFIRMATION',
-                    description = ?,
+                SET description = ?,
                     updated_at = CURRENT_TIMESTAMP
                 WHERE user_jid = ?
             `).run(text, sender)
 
             addLog('info', `Descripción guardada para ${sender}: ${text}`)
+            await updateSavedReportData(sender)
             await sendReportSummary()
+            await sendQueuedMessage(sock, sender, { text: FINAL_SUCCESS_MESSAGE })
+            deleteSessionWithoutPhoto(sender)
+            addLog('message_out', `Reporte completado con descripción por ${sender}. Sesión cerrada.`)
             return true
         }
 
@@ -1122,9 +1320,11 @@ async function connectToWhatsApp() {
     // Sincronizar reportes pendientes que hayan quedado de sesiones anteriores
     triggerSyncPendingReports().catch(e => addLog('error', `Error al sincronizar reportes pendientes en arranque: ${e.message}`))
 
-    // Programar limpieza periódica cada 15 minutos en segundo plano (sin mensajes a usuarios)
+    // Programar limpieza periódica cada 1 minuto en segundo plano (revisa sesiones con >15 min de inactividad)
     if (!global.cleanupInterval) {
-        global.cleanupInterval = setInterval(cleanupExpiredSessionsAndFiles, 15 * 60 * 1000)
+        global.cleanupInterval = setInterval(() => {
+            cleanupExpiredSessionsAndFiles().catch(e => addLog('error', `Error en intervalo de limpieza: ${e.message}`))
+        }, 60 * 1000)
     }
 
     // Programar reintento periódico de reportes pendientes cada 30 segundos
@@ -1143,8 +1343,9 @@ async function connectToWhatsApp() {
         logger: pino({ level: 'silent' })
     })
 
-    // Asignar el socket activo a la cola de salida
+    // Asignar el socket activo a la cola de salida y referencia global
     defaultQueue.setSocket(sock)
+    global.activeSock = sock
 
     // Vinculación segura por consola si el número no está registrado aún
     if (!state.creds.registered) {
@@ -1267,6 +1468,7 @@ if (process.env.NODE_ENV === 'test') {
     module.exports = {
         db,
         closeDatabase,
+        FINAL_SUCCESS_MESSAGE,
         SESSION_TIMEOUT_MS,
         parseSessionUtcTimestamp,
         isSessionExpired,
@@ -1277,6 +1479,7 @@ if (process.env.NODE_ENV === 'test') {
         getNextRetryDelayMs,
         processSinglePendingReport,
         triggerSyncPendingReports,
+        updateSavedReportData,
         handleFloodReportFlow,
         AFFECTATION_CATEGORIES,
         UPLOADS_DIR,
@@ -1285,6 +1488,7 @@ if (process.env.NODE_ENV === 'test') {
         sendReportConfirmationInterface,
         executeReportConfirmation,
         sendAffectationPoll,
+        getReportSummaryText,
         defaultQueue,
         sendQueuedMessage,
         DECISION_INTERFACE_MODE: null,

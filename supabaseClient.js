@@ -282,6 +282,97 @@ async function insertReportRecord(reportData) {
 }
 
 /**
+ * Actualiza un reporte existente en public.reportes_whatsapp sin alterar
+ * su estado de verificación administrativa ('estado') ni su fecha de creación ('creado_en').
+ * @param {string} reportId - UUID del reporte a actualizar.
+ * @param {object} updateData - Campos a actualizar (description/descripcion, afectaciones/selected_affectations).
+ * @returns {Promise<{success: boolean, data?: object, error?: string}>}
+ */
+async function updateReportRecord(reportId, updateData) {
+    if (!isSupabaseConfigured() || !supabase) {
+        return { success: false, error: 'Supabase no está configurado.' }
+    }
+    if (!reportId) {
+        return { success: false, error: 'ID de reporte obligatorio para actualización.' }
+    }
+
+    try {
+        const fields = {}
+
+        if (updateData.description !== undefined || updateData.descripcion !== undefined) {
+            const desc = updateData.descripcion ?? updateData.description
+            fields.descripcion = (desc && typeof desc === 'string' && desc.trim().length > 0) ? desc.trim() : 'Sin descripción'
+        }
+
+        if (updateData.selected_affectations !== undefined || updateData.afectaciones !== undefined || updateData.affectations !== undefined) {
+            let afectacionesArray = []
+            if (Array.isArray(updateData.afectaciones)) {
+                afectacionesArray = updateData.afectaciones
+            } else if (Array.isArray(updateData.affectations)) {
+                afectacionesArray = updateData.affectations
+            } else if (Array.isArray(updateData.selected_affectations)) {
+                afectacionesArray = updateData.selected_affectations
+            } else if (typeof updateData.selected_affectations === 'string') {
+                try {
+                    const parsed = JSON.parse(updateData.selected_affectations)
+                    afectacionesArray = Array.isArray(parsed) ? parsed : []
+                } catch (_) {
+                    afectacionesArray = []
+                }
+            }
+            fields.afectaciones = afectacionesArray
+        }
+
+        if (Object.keys(fields).length === 0) {
+            return { success: true }
+        }
+
+        const { data, error } = await supabase
+            .from(SUPABASE_TABLE_REPORTS)
+            .update(fields)
+            .eq('id', reportId)
+            .select()
+
+        if (error) {
+            return { success: false, error: error.message }
+        }
+
+        return {
+            success: true,
+            data: data?.[0] || null
+        }
+    } catch (err) {
+        return { success: false, error: err.message }
+    }
+}
+
+/**
+ * Elimina un reporte de public.reportes_whatsapp ante una cancelación explícita del usuario.
+ * @param {string} reportId - UUID del reporte a eliminar.
+ * @returns {Promise<{success: boolean, error?: string}>}
+ */
+async function deleteReportRecord(reportId) {
+    if (!isSupabaseConfigured() || !supabase) {
+        return { success: false, error: 'Supabase no está configurado.' }
+    }
+    if (!reportId) return { success: false, error: 'ID de reporte no proporcionado.' }
+
+    try {
+        const { error } = await supabase
+            .from(SUPABASE_TABLE_REPORTS)
+            .delete()
+            .eq('id', reportId)
+
+        if (error) {
+            return { success: false, error: error.message }
+        }
+        return { success: true }
+    } catch (err) {
+        return { success: false, error: err.message }
+    }
+}
+
+/**
  * PASO 5 y 6 (Orquestador): Sincroniza un reporte completo hacia Supabase:
  * 1. Sube la fotografía a Supabase Storage (si existe en disco local).
  * 2. Inserta el registro con la URL de la imagen en public.reportes_whatsapp.
@@ -386,6 +477,8 @@ module.exports = {
     testConnection,
     uploadReportPhoto,
     insertReportRecord,
+    updateReportRecord,
+    deleteReportRecord,
     syncReportToSupabase,
     SUPABASE_TABLE_REPORTS,
     SUPABASE_STORAGE_BUCKET,
