@@ -1,0 +1,873 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Simulador Interactivo de FloodBot — Atención Manual y FSM</title>
+    <style>
+        :root {
+            --wa-bg: #0c1317;
+            --wa-panel-bg: #111b21;
+            --wa-chat-bg: #0b141a;
+            --wa-header-bg: #202c33;
+            --wa-bubble-bot: #202c33;
+            --wa-bubble-citizen: #005c4b;
+            --wa-bubble-advisor: #0c4a6e;
+            --wa-border: #222d34;
+            --wa-text: #e9edef;
+            --wa-text-muted: #8696a0;
+            --wa-green: #00a884;
+            --wa-blue: #0284c7;
+            --wa-yellow: #eab308;
+            --wa-red: #ef4444;
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+        }
+
+        body {
+            background-color: var(--wa-bg);
+            color: var(--wa-text);
+            height: 100vh;
+            display: flex;
+            overflow: hidden;
+        }
+
+        /* PANEL LATERAL DE CONTROL */
+        .sidebar {
+            width: 420px;
+            background-color: var(--wa-panel-bg);
+            border-right: 1px solid var(--wa-border);
+            display: flex;
+            flex-direction: column;
+            overflow-y: auto;
+        }
+
+        .sidebar-header {
+            padding: 16px 20px;
+            background-color: var(--wa-header-bg);
+            border-bottom: 1px solid var(--wa-border);
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+
+        .sidebar-header h2 {
+            font-size: 16px;
+            font-weight: 600;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .sidebar-content {
+            padding: 16px;
+            display: flex;
+            flex-direction: column;
+            gap: 16px;
+        }
+
+        .card {
+            background-color: #182229;
+            border: 1px solid var(--wa-border);
+            border-radius: 8px;
+            padding: 14px;
+        }
+
+        .card-title {
+            font-size: 13px;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            color: var(--wa-text-muted);
+            margin-bottom: 10px;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+
+        .btn {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            gap: 6px;
+            padding: 9px 12px;
+            border-radius: 6px;
+            border: none;
+            font-size: 13px;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.15s ease;
+            width: 100%;
+        }
+
+        .btn-primary {
+            background-color: var(--wa-green);
+            color: #111b21;
+            font-weight: 600;
+        }
+        .btn-primary:hover { background-color: #06cf9c; }
+
+        .btn-blue {
+            background-color: #0369a1;
+            color: #ffffff;
+        }
+        .btn-blue:hover { background-color: #0284c7; }
+
+        .btn-warning {
+            background-color: #ca8a04;
+            color: #ffffff;
+        }
+        .btn-warning:hover { background-color: #eab308; }
+
+        .btn-danger {
+            background-color: #991b1b;
+            color: #ffffff;
+        }
+        .btn-danger:hover { background-color: #dc2626; }
+
+        .btn-outline {
+            background-color: #202c33;
+            color: var(--wa-text);
+            border: 1px solid #374248;
+            text-align: left;
+            justify-content: flex-start;
+            padding: 8px 10px;
+            margin-bottom: 6px;
+            line-height: 1.3;
+        }
+        .btn-outline:hover {
+            background-color: #2a3942;
+            border-color: #8696a0;
+        }
+
+        .step-item {
+            font-size: 12.5px;
+            line-height: 1.45;
+            padding: 6px 0;
+            border-bottom: 1px solid rgba(255,255,255,0.06);
+            display: flex;
+            gap: 8px;
+        }
+        .step-num {
+            background: #2a3942;
+            color: var(--wa-text);
+            border-radius: 50%;
+            width: 18px;
+            height: 18px;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 11px;
+            font-weight: bold;
+            flex-shrink: 0;
+            margin-top: 2px;
+        }
+
+        .info-row {
+            display: flex;
+            justify-content: space-between;
+            font-size: 12.5px;
+            padding: 4px 0;
+            border-bottom: 1px solid rgba(255,255,255,0.04);
+        }
+        .info-label { color: var(--wa-text-muted); }
+        .info-val { font-weight: 600; color: #53bdeb; }
+
+        /* AREA DE CHAT */
+        .chat-area {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            background-color: var(--wa-chat-bg);
+            background-image: radial-gradient(rgba(255,255,255,0.03) 1px, transparent 0);
+            background-size: 24px 24px;
+            position: relative;
+        }
+
+        /* HEADER DEL CHAT */
+        .chat-header {
+            height: 64px;
+            background-color: var(--wa-header-bg);
+            border-bottom: 1px solid var(--wa-border);
+            padding: 10px 20px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            z-index: 10;
+        }
+
+        .contact-info {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        .avatar {
+            width: 42px;
+            height: 42px;
+            border-radius: 50%;
+            background: linear-gradient(135deg, #0284c7, #00a884);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 20px;
+        }
+
+        .contact-name {
+            font-size: 15px;
+            font-weight: 600;
+        }
+
+        .contact-status {
+            font-size: 12px;
+            color: var(--wa-text-muted);
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+
+        .status-pill {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            padding: 4px 10px;
+            border-radius: 20px;
+            font-size: 12px;
+            font-weight: 600;
+        }
+        .pill-auto { background-color: rgba(0, 168, 132, 0.2); color: #25d366; border: 1px solid rgba(0,168,132,0.4); }
+        .pill-advisor { background-color: rgba(234, 179, 8, 0.2); color: #facc15; border: 1px solid rgba(234,179,8,0.4); }
+        .pill-cooldown { background-color: rgba(2, 132, 199, 0.2); color: #38bdf8; border: 1px solid rgba(2,132,199,0.4); }
+        .pill-idle { background-color: rgba(134, 150, 160, 0.2); color: #8696a0; border: 1px solid rgba(134,150,160,0.4); }
+
+        /* LISTA DE MENSAJES */
+        .messages-container {
+            flex: 1;
+            padding: 20px 40px;
+            overflow-y: auto;
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+
+        .bubble-wrapper {
+            display: flex;
+            flex-direction: column;
+            max-width: 70%;
+        }
+        .bubble-wrapper.left { align-self: flex-start; }
+        .bubble-wrapper.right { align-self: flex-end; }
+
+        .sender-badge {
+            font-size: 11px;
+            font-weight: 700;
+            margin-bottom: 2px;
+            padding: 0 4px;
+            display: flex;
+            align-items: center;
+            gap: 4px;
+        }
+        .badge-bot { color: #53bdeb; }
+        .badge-citizen { color: #25d366; text-align: right; justify-content: flex-end; }
+        .badge-advisor { color: #38bdf8; text-align: right; justify-content: flex-end; }
+
+        .bubble {
+            padding: 8px 12px;
+            border-radius: 8px;
+            position: relative;
+            font-size: 14px;
+            line-height: 1.45;
+            white-space: pre-wrap;
+            word-break: break-word;
+            box-shadow: 0 1px 1px rgba(0,0,0,0.15);
+        }
+
+        .bubble.bot {
+            background-color: var(--wa-bubble-bot);
+            color: var(--wa-text);
+            border-top-left-radius: 0;
+        }
+
+        .bubble.citizen {
+            background-color: var(--wa-bubble-citizen);
+            color: var(--wa-text);
+            border-top-right-radius: 0;
+        }
+
+        .bubble.advisor {
+            background-color: var(--wa-bubble-advisor);
+            color: var(--wa-text);
+            border-top-right-radius: 0;
+            border-left: 3px solid #38bdf8;
+        }
+
+        .bubble-time {
+            font-size: 10.5px;
+            color: var(--wa-text-muted);
+            float: right;
+            margin-left: 10px;
+            margin-top: 4px;
+        }
+
+        .bubble.citizen .bubble-time, .bubble.advisor .bubble-time {
+            color: rgba(255, 255, 255, 0.65);
+        }
+
+        /* FOOTER DE ENTRADA */
+        .chat-footer {
+            background-color: var(--wa-header-bg);
+            border-top: 1px solid var(--wa-border);
+            padding: 12px 20px;
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+
+        .role-selector {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            background: #182229;
+            padding: 6px 12px;
+            border-radius: 6px;
+            border: 1px solid var(--wa-border);
+        }
+
+        .role-label {
+            font-size: 12px;
+            color: var(--wa-text-muted);
+            font-weight: 600;
+        }
+
+        .role-radio {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            font-size: 13px;
+            cursor: pointer;
+            padding: 4px 10px;
+            border-radius: 4px;
+            transition: all 0.15s ease;
+        }
+
+        .role-radio.active.citizen {
+            background-color: rgba(0, 168, 132, 0.25);
+            color: #25d366;
+            font-weight: 700;
+        }
+
+        .role-radio.active.advisor {
+            background-color: rgba(2, 132, 199, 0.3);
+            color: #38bdf8;
+            font-weight: 700;
+        }
+
+        .input-bar {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .chat-input {
+            flex: 1;
+            background-color: #2a3942;
+            border: 1px solid transparent;
+            color: var(--wa-text);
+            padding: 11px 16px;
+            border-radius: 8px;
+            font-size: 14px;
+            outline: none;
+            transition: border-color 0.15s ease;
+        }
+        .chat-input:focus { border-color: var(--wa-green); }
+
+        .btn-send {
+            width: 44px;
+            height: 44px;
+            border-radius: 50%;
+            background-color: var(--wa-green);
+            color: #111b21;
+            border: none;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 18px;
+            flex-shrink: 0;
+            transition: transform 0.1s ease;
+        }
+        .btn-send:hover { transform: scale(1.05); }
+
+        .btn-attach {
+            width: 38px;
+            height: 38px;
+            border-radius: 50%;
+            background-color: #202c33;
+            color: var(--wa-text-muted);
+            border: 1px solid #374248;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 16px;
+            flex-shrink: 0;
+            transition: all 0.15s ease;
+        }
+        .btn-attach:hover {
+            background-color: #2a3942;
+            color: var(--wa-text);
+            border-color: #8696a0;
+            transform: scale(1.08);
+        }
+
+        /* Estilo para links y texto enriquecido */
+        .bubble b, .bubble strong { font-weight: 700; }
+        .bubble a { color: #53bdeb; text-decoration: none; }
+        .bubble a:hover { text-decoration: underline; }
+
+        .notice-banner {
+            align-self: center;
+            background-color: #182229;
+            border: 1px solid var(--wa-border);
+            border-radius: 6px;
+            padding: 6px 14px;
+            font-size: 12px;
+            color: var(--wa-text-muted);
+            text-align: center;
+            margin: 6px 0;
+        }
+    </style>
+</head>
+<body>
+
+    <!-- PANEL LATERAL DE CONTROL Y GUÍA DE PRUEBA -->
+    <div class="sidebar">
+        <div class="sidebar-header">
+            <h2>🧪 Consola de Simulación</h2>
+            <button class="btn btn-danger" style="width: auto; padding: 5px 10px; font-size: 11px;" onclick="resetSimulation()">🔄 Reiniciar</button>
+        </div>
+
+        <div class="sidebar-content">
+
+            <!-- ACCIÓN RÁPIDA: AVANZAR TIEMPO -->
+            <div class="card" style="border-left: 4px solid #0284c7;">
+                <div class="card-title">⏩ Control de Tiempo</div>
+                <p style="font-size: 12px; color: var(--wa-text-muted); margin-bottom: 10px;">
+                    Simula el paso del tiempo sin esperar realmente.
+                </p>
+                <div style="display: flex; flex-direction: column; gap: 8px;">
+                    <button class="btn btn-blue" onclick="fastForward15m()">⏩ Adelantar 15 Minutos (+15m)</button>
+                    <button class="btn btn-warning" onclick="fastForward2h()">⏳ Simular 2 Horas de Silencio (+2h)</button>
+                </div>
+            </div>
+
+            <!-- GUÍA PASO A PASO DEL MODO ASESOR -->
+            <div class="card">
+                <div class="card-title">📋 Secuencia de Prueba (Modo Asesor)</div>
+                <div class="step-item">
+                    <span class="step-num">1</span>
+                    <div>Ciudadano envía <b>"Hola"</b> o <b>"REPORTAR"</b> (inicia bot automático).</div>
+                </div>
+                <div class="step-item">
+                    <span class="step-num">2</span>
+                    <div>Asesor interviene: <b>"Hola, te habla un asesor. Voy a ayudarte..."</b></div>
+                </div>
+                <div class="step-item">
+                    <span class="step-num">3</span>
+                    <div>FloodBot detecta la intervención y se <b>pausa en silencio</b>.</div>
+                </div>
+                <div class="step-item">
+                    <span class="step-num">4</span>
+                    <div>Ciudadano escribe dudas y FloodBot <b>no responde</b>.</div>
+                </div>
+                <div class="step-item">
+                    <span class="step-num">5</span>
+                    <div>Asesor envía: <b>"Gracias. Reporte recibido..."</b> (cierre manual).</div>
+                </div>
+                <div class="step-item">
+                    <span class="step-num">6</span>
+                    <div>FloodBot inicia <b>enfriamiento de 15 minutos</b>.</div>
+                </div>
+                <div class="step-item">
+                    <span class="step-num">7</span>
+                    <div>Ciudadano responde <b>"Gracias"</b> (bot sigue en silencio, timer no reinicia).</div>
+                </div>
+                <div class="step-item">
+                    <span class="step-num">8</span>
+                    <div>Ciudadano escribe <b>"REPORTAR"</b> (reactiva bot al instante).</div>
+                </div>
+                <div class="step-item">
+                    <span class="step-num">9</span>
+                    <div>O hacé clic en <b>Adelantar 15 Minutos</b> y cualquier mensaje reactiva el bot.</div>
+                </div>
+            </div>
+
+            <!-- ATAJOS DE MENSAJE: COMO CIUDADANO -->
+            <div class="card">
+                <div class="card-title">👤 Atajos Rápidos: Ciudadano</div>
+                <button class="btn btn-outline" onclick="sendQuick('citizen', 'text', 'Hola')">🌊 Enviar "Hola" (Iniciar reporte)</button>
+                <button class="btn btn-outline" onclick="sendQuick('citizen', 'location', 'Ubicación GPS', -25.298100, -57.531900)">📍 Enviar Ubicación GPS Nativa</button>
+                <button class="btn btn-outline" onclick="sendQuick('citizen', 'text', 'https://maps.app.goo.gl/JhWhCRB1Er91B1s66?g_st=aw')">🗺️ Enviar Enlace de Google Maps</button>
+                <button class="btn btn-outline" onclick="sendQuick('citizen', 'photo', 'Foto del agua entrando al garaje')">📸 Enviar Fotografía de Evidencia</button>
+                <button class="btn btn-outline" onclick="sendQuick('citizen', 'poll_vote', 'Calle inundada, Vivienda afectada', null, null, ['Calle inundada', 'Vivienda afectada'])">⛈️ Votar Afectaciones en Encuesta</button>
+                <button class="btn btn-outline" onclick="sendQuick('citizen', 'text', 'LISTO')">✍️ Enviar "LISTO" (Completar reporte)</button>
+                <button class="btn btn-outline" onclick="sendQuick('citizen', 'text', 'Muchas gracias por la atención!')">🙏 Enviar "Muchas gracias" (Cortesía)</button>
+                <button class="btn btn-outline" onclick="sendQuick('citizen', 'text', 'REPORTAR')">🔄 Enviar "REPORTAR" (Reactivar)</button>
+                <button class="btn btn-outline" onclick="sendQuick('citizen', 'text', '0')">❌ Enviar "0" (Cancelar)</button>
+            </div>
+
+            <!-- ATAJOS DE MENSAJE: COMO ASESOR -->
+            <div class="card" style="border-left: 4px solid #38bdf8;">
+                <div class="card-title">👨‍💼 Atajos Rápidos: Asesor Humano</div>
+                <button class="btn btn-outline" onclick="sendQuick('advisor', 'text', 'Hola, te habla un asesor. Voy a ayudarte con tu reporte.')">
+                    👨‍💼 <b>Intervención:</b> "Hola, te habla un asesor..."
+                </button>
+                <button class="btn btn-outline" onclick="sendQuick('advisor', 'text', '¿El agua sigue subiendo frente a tu casa?')">
+                    💬 <b>Pregunta:</b> "¿El agua sigue subiendo...?"
+                </button>
+                <button class="btn btn-outline" onclick="sendQuick('advisor', 'text', 'Gracias. Reporte recibido.\n\nTu reporte ha sido recibido correctamente.\n\nSi querés realizar otro reporte, escribí REPORTAR para iniciar uno nuevo.')">
+                    🏁 <b>Cierre Oficial:</b> "Gracias. Reporte recibido..."
+                </button>
+            </div>
+
+            <!-- INSPECTOR DE ESTADO EN SQLITE -->
+            <div class="card">
+                <div class="card-title">📊 Estado SQLite (Tiempo Real)</div>
+                <div class="info-row">
+                    <span class="info-label">Modo Actual:</span>
+                    <span class="info-val" id="db-mode">IDLE</span>
+                </div>
+                <div class="info-row">
+                    <span class="info-label">Estado FSM:</span>
+                    <span class="info-val" id="db-fsm">-</span>
+                </div>
+                <div class="info-row">
+                    <span class="info-label">Coordenadas:</span>
+                    <span class="info-val" id="db-coords">-</span>
+                </div>
+                <div class="info-row">
+                    <span class="info-label">Foto Registrada:</span>
+                    <span class="info-val" id="db-photo">No</span>
+                </div>
+                <div class="info-row">
+                    <span class="info-label">ID Reporte SQLite:</span>
+                    <span class="info-val" id="db-report-id">-</span>
+                </div>
+                <div class="info-row">
+                    <span class="info-label">Estado Asesor:</span>
+                    <span class="info-val" id="db-advisor">-</span>
+                </div>
+                <div class="info-row">
+                    <span class="info-label">Cooldown Restante:</span>
+                    <span class="info-val" id="db-cooldown">-</span>
+                </div>
+            </div>
+
+        </div>
+    </div>
+
+    <!-- AREA DEL CHAT DE WHATSAPP -->
+    <div class="chat-area">
+        <!-- HEADER -->
+        <div class="chat-header">
+            <div class="contact-info">
+                <div class="avatar">🌊</div>
+                <div>
+                    <div class="contact-name">FloodBot — Monitoreo de Inundaciones</div>
+                    <div class="contact-status">
+                        <span id="header-status-pill" class="status-pill pill-idle">⚪ En reposo</span>
+                        <span>• Ciudadano: +595 981 123456</span>
+                    </div>
+                </div>
+            </div>
+            <div>
+                <button class="btn btn-blue" style="width: auto; padding: 6px 14px; font-size: 12px;" onclick="fastForward15m()">⏩ +15 min</button>
+            </div>
+        </div>
+
+        <!-- MENSAJES -->
+        <div class="messages-container" id="messages-container">
+            <div class="notice-banner">
+                🔒 Simulación local aislada iniciada. sessions.db, WhatsApp real y Supabase están protegidos.
+            </div>
+        </div>
+
+        <!-- FOOTER DE ESCRITURA -->
+        <div class="chat-footer">
+            <div class="role-selector">
+                <span class="role-label">Enviar mensaje como:</span>
+                <label class="role-radio active citizen" id="label-citizen">
+                    <input type="radio" name="sender-role" value="citizen" checked onchange="updateRoleUi()"> 👤 Ciudadano
+                </label>
+                <label class="role-radio advisor" id="label-advisor">
+                    <input type="radio" name="sender-role" value="advisor" onchange="updateRoleUi()"> 👨‍💼 Asesor Humano (Desde WhatsApp del Laboratorio)
+                </label>
+            </div>
+
+            <form class="input-bar" onsubmit="handleFormSubmit(event)">
+                <input type="file" id="file-input" accept="image/*" style="display: none;" onchange="handleFileSelect(event)">
+                <button type="button" class="btn-attach" onclick="document.getElementById('file-input').click()" title="Adjuntar foto real desde tu PC">📷</button>
+                <button type="button" class="btn-attach" onclick="sendQuick('citizen', 'photo', 'Foto de anegamiento en la calle')" title="Enviar foto simulada rápida">⚡📸</button>
+                <input type="text" id="chat-input" class="chat-input" placeholder="Escribí un mensaje..." autocomplete="off">
+                <button type="submit" class="btn-send" title="Enviar">➤</button>
+            </form>
+        </div>
+    </div>
+
+    <script>
+        let currentRole = 'citizen';
+
+        function updateRoleUi() {
+            const citizenRadio = document.querySelector('input[name="sender-role"][value="citizen"]');
+            const labelCitizen = document.getElementById('label-citizen');
+            const labelAdvisor = document.getElementById('label-advisor');
+            const chatInput = document.getElementById('chat-input');
+
+            if (citizenRadio.checked) {
+                currentRole = 'citizen';
+                labelCitizen.classList.add('active');
+                labelAdvisor.classList.remove('active');
+                chatInput.placeholder = 'Escribí como Ciudadano (ej: Hola, REPORTAR, o tu consulta)...';
+            } else {
+                currentRole = 'advisor';
+                labelCitizen.classList.remove('active');
+                labelAdvisor.classList.add('active');
+                chatInput.placeholder = 'Escribí como Asesor Humano (ej: Hola, te habla un asesor / Gracias. Reporte recibido)...';
+            }
+        }
+
+        async function fetchState() {
+            try {
+                const res = await fetch('/api/state');
+                const data = await res.json();
+                renderState(data);
+            } catch (err) {
+                console.error('Error al consultar estado:', err);
+            }
+        }
+
+        function renderState(data) {
+            // Pill del Header
+            const pill = document.getElementById('header-status-pill');
+            pill.textContent = data.statusLabel;
+            pill.className = 'status-pill pill-' + data.statusType;
+
+            // Inspector lateral
+            document.getElementById('db-mode').textContent = data.mode;
+            document.getElementById('db-fsm').textContent = data.session?.state || 'IDLE';
+            document.getElementById('db-coords').textContent = (data.session?.latitude && data.session?.longitude)
+                ? `${data.session.latitude.toFixed(4)}, ${data.session.longitude.toFixed(4)}`
+                : 'Ninguna';
+            document.getElementById('db-photo').textContent = data.session?.photo_path ? 'Sí ✅' : 'No';
+            document.getElementById('db-report-id').textContent = data.session?.report_id ? data.session.report_id.substring(0, 13) + '...' : 'Ninguno';
+            document.getElementById('db-advisor').textContent = data.advisor ? `${data.advisor.status}` : 'Inactivo';
+
+            if (data.cooldownRemainingSeconds > 0) {
+                const mins = Math.floor(data.cooldownRemainingSeconds / 60);
+                const secs = data.cooldownRemainingSeconds % 60;
+                document.getElementById('db-cooldown').textContent = `${mins}m ${secs}s`;
+            } else {
+                document.getElementById('db-cooldown').textContent = 'Ninguno';
+            }
+
+            // Renderizar Mensajes
+            renderMessages(data.messages || []);
+        }
+
+        let renderedCount = 0;
+        function renderMessages(messages) {
+            const container = document.getElementById('messages-container');
+
+            if (messages.length === 0) {
+                container.innerHTML = `
+                    <div class="notice-banner">
+                        🔒 Simulación local aislada iniciada. sessions.db, WhatsApp real y Supabase están protegidos.
+                    </div>
+                    <div class="notice-banner" style="background:#202c33; color:#53bdeb;">
+                        👉 Escribí <b>"Hola"</b> o seleccioná un atajo de la izquierda para comenzar.
+                    </div>
+                `;
+                renderedCount = 0;
+                return;
+            }
+
+            if (messages.length !== renderedCount) {
+                container.innerHTML = `
+                    <div class="notice-banner">
+                        🔒 Simulación local aislada iniciada. sessions.db, WhatsApp real y Supabase están protegidos.
+                    </div>
+                `;
+
+                messages.forEach(msg => {
+                    const wrapper = document.createElement('div');
+
+                    // Notificación de sistema (Adelanto de tiempo / avisos)
+                    if (msg.sender === 'system') {
+                        wrapper.className = 'notice-banner';
+                        wrapper.style.backgroundColor = '#1f2c34';
+                        wrapper.style.color = '#38bdf8';
+                        wrapper.style.border = '1px solid rgba(56, 189, 248, 0.3)';
+                        wrapper.style.padding = '8px 16px';
+                        wrapper.style.maxWidth = '85%';
+                        wrapper.style.lineHeight = '1.4';
+                        wrapper.innerHTML = escapeHtml(msg.text || '');
+                        container.appendChild(wrapper);
+                        return;
+                    }
+
+                    const isLeft = msg.sender === 'bot';
+                    wrapper.className = `bubble-wrapper ${isLeft ? 'left' : 'right'}`;
+
+                    let badgeText = '';
+                    let badgeClass = '';
+                    let bubbleClass = '';
+
+                    if (msg.sender === 'bot') {
+                        badgeText = '🤖 FloodBot (Automático)';
+                        badgeClass = 'badge-bot';
+                        bubbleClass = 'bot';
+                    } else if (msg.sender === 'advisor') {
+                        badgeText = '👨‍💼 Asesor Humano (Desde WhatsApp del Laboratorio)';
+                        badgeClass = 'badge-advisor';
+                        bubbleClass = 'advisor';
+                    } else {
+                        badgeText = '👤 Ciudadano (Juan Pérez)';
+                        badgeClass = 'badge-citizen';
+                        bubbleClass = 'citizen';
+                    }
+
+                    const timeStr = new Date(msg.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+
+                    // Formato de texto con soporte simple para *negritas* y enlaces
+                    let formattedText = escapeHtml(msg.text || '')
+                        .replace(/\*([^\*]+)\*/g, '<b>$1</b>')
+                        .replace(/(https?:\/\/[^\s]+)/g, '<a href="$1" target="_blank">$1</a>');
+
+                    let mediaHtml = '';
+                    if (msg.imagePreview) {
+                        mediaHtml = `<img src="${msg.imagePreview}" style="max-width: 260px; max-height: 200px; border-radius: 6px; margin-bottom: 6px; display: block; object-fit: cover;">`;
+                    } else if (msg.type === 'photo') {
+                        mediaHtml = `
+                            <div style="background: rgba(0,0,0,0.25); padding: 10px 14px; border-radius: 6px; margin-bottom: 6px; display: flex; align-items: center; gap: 10px; border: 1px dashed rgba(255,255,255,0.2);">
+                                <span style="font-size: 24px;">📸</span>
+                                <div>
+                                    <div style="font-weight: 600; font-size: 13px;">Fotografía de Evidencia</div>
+                                    <div style="font-size: 11px; color: rgba(255,255,255,0.7);">Imagen JPEG recibida y validada</div>
+                                </div>
+                            </div>
+                        `;
+                    }
+
+                    wrapper.innerHTML = `
+                        <div class="sender-badge ${badgeClass}">${badgeText}</div>
+                        <div class="bubble ${bubbleClass}">
+                            ${mediaHtml}
+                            <div>${formattedText}</div>
+                            <span class="bubble-time">${timeStr}</span>
+                        </div>
+                    `;
+
+                    container.appendChild(wrapper);
+                });
+
+                container.scrollTop = container.scrollHeight;
+                renderedCount = messages.length;
+            }
+        }
+
+        function handleFileSelect(event) {
+            const file = event.target.files && event.target.files[0];
+            if (!file) return;
+
+            const reader = new FileReader();
+            reader.onload = function(e) {
+                const dataUrl = e.target.result;
+                sendMessage({
+                    role: 'citizen',
+                    type: 'photo',
+                    text: file.name,
+                    imagePreview: dataUrl
+                });
+            };
+            reader.readAsDataURL(file);
+            event.target.value = '';
+        }
+
+        function escapeHtml(str) {
+            return str.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+        }
+
+        async function handleFormSubmit(e) {
+            e.preventDefault();
+            const input = document.getElementById('chat-input');
+            const text = input.value.trim();
+            if (!text) return;
+            input.value = '';
+
+            await sendMessage({
+                role: currentRole,
+                type: 'text',
+                text: text
+            });
+        }
+
+        async function sendQuick(role, type, text, lat = null, lng = null, selectedOptions = null) {
+            await sendMessage({ role, type, text, lat, lng, selectedOptions });
+        }
+
+        async function sendMessage(payload) {
+            try {
+                const res = await fetch('/api/send', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+                const data = await res.json();
+                renderState(data);
+            } catch (err) {
+                console.error('Error al enviar mensaje:', err);
+            }
+        }
+
+        async function fastForward15m() {
+            try {
+                const res = await fetch('/api/fast-forward', { method: 'POST' });
+                const data = await res.json();
+                renderState(data);
+            } catch (err) {
+                console.error('Error al adelantar 15m:', err);
+            }
+        }
+
+        async function fastForward2h() {
+            try {
+                const res = await fetch('/api/fast-forward-2h', { method: 'POST' });
+                const data = await res.json();
+                renderState(data);
+            } catch (err) {
+                console.error('Error al adelantar 2h:', err);
+            }
+        }
+
+        async function resetSimulation() {
+            if (!confirm('¿Querés reiniciar la conversación de simulación?')) return;
+            try {
+                const res = await fetch('/api/reset', { method: 'POST' });
+                const data = await res.json();
+                renderState(data);
+            } catch (err) {
+                console.error('Error al reiniciar:', err);
+            }
+        }
+
+        // Cargar estado inicial y mantener polling ligero
+        fetchState();
+        setInterval(fetchState, 1500);
+    </script>
+</body>
+</html>

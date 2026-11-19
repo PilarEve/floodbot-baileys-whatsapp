@@ -1,6 +1,6 @@
 # Guía de Instalación y Despliegue en Servidor Linux
 
-Esta guía contiene los pasos exactos y secuenciales para clonar, configurar, vincular y ejecutar **FloodBot** en el servidor.
+Esta guía contiene los pasos exactos y secuenciales para clonar, configurar, validar, vincular y ejecutar **FloodBot** en el servidor del laboratorio.
 
 ---
 
@@ -33,7 +33,7 @@ cd floodbot-baileys-whatsapp
 ---
 
 ### Paso 2: Crear el Archivo de Credenciales (`.env`)
-Por razones de seguridad y privacidad, las credenciales de Supabase no se suben a GitHub. Debés crearlas manualmente en el servidor:
+Por razones de seguridad y privacidad, las credenciales de Supabase no se suben al repositorio. Debés crearlas manualmente en el servidor:
 
 1. Creá y abrí el archivo con el editor nano:
    ```bash
@@ -66,8 +66,25 @@ npm install
 
 ---
 
-### Paso 4: Diagnóstico de Conexión a Supabase
-Antes de encender el bot de WhatsApp, comprobá que el servidor tenga acceso a la base de datos y al bucket de fotos en la nube:
+### Paso 4: Ejecutar la Batería de Pruebas Automatizadas
+Antes de vincular WhatsApp, verificá que todos los módulos y la base de datos local funcionen al 100% en el servidor ejecutando la suite de 52 pruebas:
+
+```bash
+npm test
+```
+
+**Salida esperada al finalizar:**
+```text
+==============================================================================
+🎉 BATERÍA COMPLETA: 52 de 52 pruebas aprobadas exitosamente.
+🛡️ Aislamiento verificado: sessions.db y uploads/ reales no sufrieron modificaciones.
+==============================================================================
+```
+
+---
+
+### Paso 5: Diagnóstico de Conexión a Supabase
+Comprobá que el servidor tenga acceso a la base de datos PostgreSQL y al bucket de fotos de Supabase en la nube:
 
 ```bash
 node supabaseClient.js
@@ -86,8 +103,8 @@ Resultado del test: {
 
 ---
 
-### Paso 5: Primer Arranque y Vinculación de WhatsApp
-Iniciá el bot por primera vez en primer plano para vincular el número de teléfono:
+### Paso 6: Primer Arranque y Vinculación de WhatsApp
+Iniciá el bot por primera vez en primer plano para vincular la línea de WhatsApp:
 
 ```bash
 node bot.js
@@ -112,53 +129,74 @@ node bot.js
    ✅ WHATSAPP CONECTADO EXITOSAMENTE
    ```
 
-*(Una vez vinculado, la sesión queda guardada de forma permanente en la carpeta `auth_info_baileys/` del servidor; no hace falta volver a vincular).*
+*(Una vez vinculado, la sesión queda guardada de forma permanente en la carpeta `auth_info_baileys/` del servidor; no hace falta volver a vincular tras reiniciar).*
 
 ---
 
-## 🔄 Ejecución Permanente en Segundo Plano (24/7)
+## 🔄 Opciones para Ejecución Permanente en Segundo Plano (24/7)
 
-Para que el bot continúe funcionando ininterrumpidamente aunque cierres la terminal o la conexión SSH:
+### Opción A: Gestor de Procesos PM2 (Recomendada para Producción)
 
-### Iniciar en segundo plano:
+PM2 mantiene el bot corriendo 24/7 y lo reinicia automáticamente en caso de error o reinicio del servidor:
+
 ```bash
+# 1. Instalar PM2 globalmente
+sudo npm install -g pm2
+
+# 2. Iniciar FloodBot
+pm2 start bot.js --name "floodbot"
+
+# 3. Configurar para que arranque automáticamente con el sistema
+pm2 save
+pm2 startup
+```
+
+**Comandos útiles de PM2:**
+* Ver logs en tiempo real: `pm2 logs floodbot`
+* Ver consumo de CPU y memoria: `pm2 status`
+* Reiniciar bot: `pm2 restart floodbot`
+* Detener bot: `pm2 stop floodbot`
+
+---
+
+### Opción B: Ejecución Clásica con `nohup` (Sin instalar herramientas extra)
+
+Si preferís no instalar PM2, podés usar `nohup`:
+
+```bash
+# Iniciar en segundo plano
 nohup node bot.js > bot.log 2>&1 &
-```
 
-### Ver la actividad del bot en tiempo real:
-```bash
+# Ver la actividad en tiempo real
 tail -f bot.log
-```
-*(Para salir de la visualización en vivo, presioná `Ctrl + C`).*
 
-### Detener el bot:
-```bash
+# Detener el bot
 pkill -f "node bot.js"
-```
 
-### Reiniciar el bot:
-```bash
+# Reiniciar el bot
 pkill -f "node bot.js" && nohup node bot.js > bot.log 2>&1 &
 ```
 
 ---
 
-## 📁 Estructura Generada en el Servidor Tras la Instalación
+## 📁 Estructura del Repositorio en el Servidor
 
 ```
 floodbot-baileys-whatsapp/
-├── auth_info_baileys/    # Creado automáticamente tras vincular el número (sesión WhatsApp)
-├── node_modules/         # Librerías instaladas por npm
-├── uploads/              # Buffer temporal para recepción de fotos
-├── .env                  # Credenciales secretas de Supabase (creado en Paso 2)
-├── .gitignore            # Reglas de exclusión de Git
-├── bot.js                # Orquestador del bot y lógica de estados
-├── bot.log               # Registro histórico de actividad (generado por nohup)
-├── INSTALACION.md        # Este documento
-├── package.json          # Manifiesto de dependencias del bot
-├── package-lock.json     # Versiones congeladas de librerías
-├── README.md             # Documentación general y arquitectura
-├── sessions.db           # Base SQLite local para persistencia de estados
-└── supabaseClient.js     # Cliente de integración con Supabase
+├── auth_info_baileys/       # Claves criptográficas y sesión activa de WhatsApp (creado al vincular)
+├── docs/                    # Centro didáctico de documentación técnica (17 capítulos)
+├── node_modules/            # Dependencias del proyecto
+├── uploads/                 # Buffer temporal de almacenamiento de imágenes
+├── .env                     # Variables de entorno y claves secretas de Supabase
+├── .gitignore               # Exclusiones de control de versiones
+├── AUDITORIA_PRE_DESPLIEGUE.md # Auditoría de seguridad
+├── bot.js                   # Núcleo y máquina de estados FSM del bot
+├── DOCUMENTACION_SISTEMA.md # Manual técnico integral del sistema
+├── INSTALACION.md           # Este documento de instalación
+├── messageQueue.js          # Cola de envíos con espaciado anti-spam y cancelación
+├── package.json             # Manifiesto de scripts y dependencias
+├── README.md                # Documentación general y arquitectura
+├── sessions.db              # Base de datos SQLite local (estados, colas y bitácora)
+├── supabaseClient.js        # Integración con Supabase Storage y PostgreSQL
+└── test_expiration.js       # Suite de 52 pruebas automatizadas
 ```
-

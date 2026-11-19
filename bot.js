@@ -28,7 +28,8 @@ const {
     jidNormalizedUser,
     getKeyAuthor,
     proto,
-    generateWAMessageFromContent
+    generateWAMessageFromContent,
+    generateMessageID
 } = require('@whiskeysockets/baileys')
 
 const {
@@ -46,7 +47,16 @@ function sendQueuedMessage(sock, jid, content, options = {}) {
     if (sock && sock !== defaultQueue.getSocket()) {
         defaultQueue.setSocket(sock)
     }
-    return defaultQueue.enqueue(jid, content, options)
+    const msgId = options.messageId || ('BOT_' + (typeof generateMessageID === 'function' ? generateMessageID() : crypto.randomUUID()))
+    recordBotOutgoingMessageId(msgId)
+    const sendOptions = { ...options, messageId: msgId }
+
+    return defaultQueue.enqueue(jid, content, sendOptions).then(result => {
+        if (result?.key?.id) {
+            recordBotOutgoingMessageId(result.key.id)
+        }
+        return result
+    })
 }
 
 // Silenciar avisos criptográficos internos de bajo nivel de libsignal (SessionEntry, buffers)
@@ -69,9 +79,12 @@ const AUTH_DIR = process.env.AUTH_DIR || path.resolve(__dirname, 'auth_info_bail
 const UPLOADS_DIR = process.env.UPLOADS_DIR || path.resolve(__dirname, 'uploads')
 const DB_PATH = process.env.DB_PATH || path.resolve(__dirname, 'sessions.db')
 
-// Tiempo máximo de inactividad por usuario (30 minutos en milisegundos)
+// Tiempo máximo de inactividad por usuario (15 minutos en milisegundos)
 const SESSION_TIMEOUT_MS = 15 * 60 * 1000
 const FINAL_SUCCESS_MESSAGE = `✅ *¡Reporte recibido correctamente!*\n\n¡Muchas gracias por tu colaboración! 🙌\n\nTu reporte contribuirá al monitoreo de inundaciones urbanas y a la identificación de zonas afectadas.\n\n🗺️ *¡Explorá nuestro mapa interactivo!*\n\nPodés visualizar los reportes de inundaciones en nuestra plataforma web:\n\n🔗 https://monitoreoinundaciones.vercel.app`
+
+// Tiempo máximo de inactividad de una atención manual activa sin cierre del asesor (2 horas de seguridad)
+const ADVISOR_ACTIVE_TIMEOUT_MS = 2 * 60 * 60 * 1000
 
 if (!fs.existsSync(UPLOADS_DIR)) {
     fs.mkdirSync(UPLOADS_DIR, { recursive: true })
@@ -118,6 +131,20 @@ db.exec(`
         type TEXT NOT NULL,
         message TEXT NOT NULL
     );
+
+    CREATE TABLE IF NOT EXISTS advisor_sessions (
+        user_jid TEXT PRIMARY KEY,
+        status TEXT NOT NULL,
+        started_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        closed_at DATETIME,
+        closed_at_ms INTEGER,
+        last_activity_ms INTEGER
+    );
+
+    CREATE TABLE IF NOT EXISTS bot_outgoing_messages (
+        id TEXT PRIMARY KEY,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
 `)
 
 // Migraciones seguras para bases de datos existentes
@@ -126,6 +153,9 @@ try {
 } catch (_) { }
 try {
     db.prepare('ALTER TABLE report_sessions ADD COLUMN storage_url TEXT').run()
+} catch (_) { }
+try {
+    db.prepare('ALTER TABLE advisor_sessions ADD COLUMN last_activity_ms INTEGER').run()
 } catch (_) { }
 
 // Helper de logging local
@@ -234,6 +264,20 @@ async function cleanupExpiredSessionsAndFiles(customSock = null) {
         // 1. Sesiones de conversación activas
         const allSessions = db.prepare('SELECT user_jid, photo_path, report_id, updated_at FROM report_sessions').all()
         for (const s of allSessions) {
+            // Si la conversación está en atención manual por asesor, verificar si superó las 2 horas de inactividad
+            const advisor = getAdvisorSession(s.user_jid)
+            if (advisor && advisor.status === 'ACTIVE') {
+                if (isAdvisorSessionExpired(advisor)) {
+                    clearAdvisorSession(s.user_jid)
+                    addLog('info', `⏰ Atención manual expirada por inactividad (>2h) para ${s.user_jid}. Sesión de asesor liberada.`)
+                } else {
+                    if (s.photo_path) {
+                        try { activePhotoPaths.add(path.resolve(s.photo_path)) } catch (_) { }
+                    }
+                    continue
+                }
+            }
+
             if (isSessionExpired(s)) {
                 // Eliminar sesión conversacional de inmediato para que nunca se procese dos veces
                 db.prepare('DELETE FROM report_sessions WHERE user_jid = ?').run(s.user_jid)
@@ -268,13 +312,24 @@ async function cleanupExpiredSessionsAndFiles(customSock = null) {
                 // Sesión activa: registrar su fotografía para que NUNCA sea eliminada
                 try {
                     activePhotoPaths.add(path.resolve(s.photo_path))
-                } catch (_) {}
+                } catch (_) { }
             }
         }
 
         if (expiredCount > 0) {
             addLog('info', `🧹 Limpieza: ${expiredCount} sesión(es) expirada(s) procesada(s) por inactividad.`)
         }
+
+        // 1.b. Sesiones de asesor activas que hayan superado las 2 horas de inactividad
+        try {
+            const allAdvisors = db.prepare("SELECT user_jid, status, started_at, last_activity_ms FROM advisor_sessions WHERE status = 'ACTIVE'").all()
+            for (const adv of allAdvisors) {
+                if (isAdvisorSessionExpired(adv)) {
+                    clearAdvisorSession(adv.user_jid)
+                    addLog('info', `⏰ Atención manual expirada por inactividad (>2h) para ${adv.user_jid}. Sesión de asesor liberada.`)
+                }
+            }
+        } catch (_) { }
 
         // 2. Reportes confirmados / auto-guardados pendientes de sincronización (NUNCA deben eliminarse sus fotos)
         try {
@@ -284,7 +339,7 @@ async function cleanupExpiredSessionsAndFiles(customSock = null) {
                     activePhotoPaths.add(path.resolve(p.photo_path))
                 }
             }
-        } catch (_) {}
+        } catch (_) { }
 
         // 3. Inspeccionar archivos en uploads/
         if (fs.existsSync(UPLOADS_DIR)) {
@@ -301,10 +356,16 @@ async function cleanupExpiredSessionsAndFiles(customSock = null) {
                         if (now - stat.mtimeMs >= SESSION_TIMEOUT_MS) {
                             safeDeleteUploadFile(fullPath)
                         }
-                    } catch (_) {}
+                    } catch (_) { }
                 }
             }
         }
+
+        // 4. Mantenimiento de registros de mensajes salientes y sesiones de asesor expiradas
+        try {
+            db.prepare("DELETE FROM bot_outgoing_messages WHERE created_at < datetime('now', '-24 hours')").run()
+            db.prepare("DELETE FROM advisor_sessions WHERE status = 'COOLDOWN' AND (? - closed_at_ms) > (24 * 60 * 60 * 1000)").run(Date.now())
+        } catch (_) { }
     } catch (err) {
         addLog('error', `Error en mantenimiento de sesiones y archivos temporales: ${err.message}`)
     }
@@ -386,7 +447,7 @@ async function processSinglePendingReport(report, customSyncDependencies = null)
                     `).run(photoPublicUrl, report.id)
                     try {
                         db.prepare('UPDATE report_sessions SET storage_url = ? WHERE report_id = ?').run(photoPublicUrl, report.id)
-                    } catch (_) {}
+                    } catch (_) { }
                     addLog('info', `📸 Foto de reporte ${report.id} subida a Storage: ${photoPublicUrl}`)
                 } else {
                     const uploadErr = uploadRes?.error || 'Fallo al subir a Storage'
@@ -492,7 +553,7 @@ async function processSinglePendingReport(report, customSyncDependencies = null)
                     updated_at = CURRENT_TIMESTAMP
                 WHERE id = ?
             `).run(nextAttempts, `Excepción: ${err.message}`, nextRetry, report.id)
-        } catch (_) {}
+        } catch (_) { }
         addLog('error', `⚠️ Excepción procesando sincronización de reporte ${report.id}: ${err.message}`)
         return { success: false, error: err.message }
     }
@@ -665,6 +726,370 @@ function getReportSummaryText(currentSession) {
         `✍️ *Descripción:* ${descStr}`
 }
 
+// ==============================================================================
+// GESTIÓN Y EXTRACCIÓN SEGURA DE UBICACIONES MEDIANTE GOOGLE MAPS
+// ==============================================================================
+
+/**
+ * Valida si un par de coordenadas es numéricamente válido y está dentro de los límites geográficos
+ */
+function isValidCoordinate(lat, lng) {
+    if (typeof lat !== 'number' || typeof lng !== 'number') return false
+    if (isNaN(lat) || isNaN(lng) || !isFinite(lat) || !isFinite(lng)) return false
+    return lat >= -90 && lat <= 90 && lng >= -180 && lng <= 180
+}
+
+/**
+ * Valida si un host pertenece a los dominios oficiales de Google Maps (SSRF protection)
+ */
+function isAllowedGoogleMapsHost(hostname) {
+    if (!hostname || typeof hostname !== 'string') return false
+    const host = hostname.toLowerCase()
+
+    if (host === 'maps.app.goo.gl' || host === 'goo.gl') return true
+    if (host === 'maps.google.com' || host === 'maps.google.com.py' || host === 'maps.google.com.ar') return true
+
+    // Coincide con google.com o google.<tld> o subdominios autorizados (maps, www)
+    const isGoogle = /^([a-z0-9-]+\.)?google\.(?:com|[a-z]{2})(?:\.[a-z]{2})?$/.test(host)
+    return isGoogle
+}
+
+/**
+ * Extrae una URL de Google Maps contenida en un texto de mensaje
+ */
+function extractGoogleMapsUrlFromText(text) {
+    if (!text || typeof text !== 'string') return null
+    const urlRegex = /https?:\/\/[^\s<>"]+/i
+    const match = text.match(urlRegex)
+    if (!match) return null
+
+    try {
+        const parsed = new URL(match[0])
+        if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null
+        if (!isAllowedGoogleMapsHost(parsed.hostname)) return null
+        return match[0]
+    } catch (_) {
+        return null
+    }
+}
+
+/**
+ * Extrae coordenadas del marcador/lugar seleccionado a partir de una URL resuelta de Google Maps.
+ * IMPORTANTE: Prioriza el marcador seleccionado (!3d/!4d o query q/ll) y NO acepta automáticamente
+ * coordenadas de la vista de cámara (@lat,lng), evitando ubicaciones erróneas.
+ */
+function extractCoordinatesFromResolvedUrl(urlStr) {
+    if (!urlStr || typeof urlStr !== 'string') return null
+
+    try {
+        // 1. Prioridad 1: Marcador de lugar o punto seleccionado en parámetros protobuf (!3d<lat>!4d<lng>)
+        const markerMatch = urlStr.match(/!3d(-?\d+(?:\.\d+)?).*?!4d(-?\d+(?:\.\d+)?)/)
+        if (markerMatch) {
+            const lat = parseFloat(markerMatch[1])
+            const lng = parseFloat(markerMatch[2])
+            if (isValidCoordinate(lat, lng)) {
+                return { lat, lng }
+            }
+        }
+
+        const parsed = new URL(urlStr)
+
+        // 2. Prioridad 2: Coordenadas explícitas en parámetros de consulta (q, query, daddr, ll)
+        const candidateParams = ['q', 'query', 'daddr', 'll']
+        for (const param of candidateParams) {
+            const val = parsed.searchParams.get(param)
+            if (val) {
+                const cleanVal = val.replace(/^loc:\s*/i, '')
+                const coordsMatch = cleanVal.match(/(-?\d+\.\d+)\s*,\s*(-?\d+\.\d+)/)
+                if (coordsMatch) {
+                    const lat = parseFloat(coordsMatch[1])
+                    const lng = parseFloat(coordsMatch[2])
+                    if (isValidCoordinate(lat, lng)) {
+                        return { lat, lng }
+                    }
+                }
+            }
+        }
+
+        // 3. Prioridad 3: Coordenadas en la ruta de place (/place/-25.299045,-57.532044)
+        const placePathMatch = parsed.pathname.match(/\/place\/(-?\d+\.\d+)[,+ ]+(-?\d+\.\d+)/)
+        if (placePathMatch) {
+            const lat = parseFloat(placePathMatch[1])
+            const lng = parseFloat(placePathMatch[2])
+            if (isValidCoordinate(lat, lng)) {
+                return { lat, lng }
+            }
+        }
+
+        // NO se extrae de /@lat,lng/ porque representa el centro de visualización de cámara,
+        // no un marcador de incidente confirmado.
+        return null
+    } catch (_) {
+        return null
+    }
+}
+
+/**
+ * Resuelve enlaces cortos de Google Maps de forma segura, siguiendo redirecciones permitidas
+ * y con protección contra SSRF y bucles infinitos.
+ */
+async function resolveGoogleMapsUrl(rawUrl, customFetch = null) {
+    const fetchFn = customFetch || global.fetch || fetch
+    if (typeof fetchFn !== 'function') return rawUrl
+
+    let currentUrl = rawUrl
+    let redirectCount = 0
+    const maxRedirects = 4
+
+    while (redirectCount < maxRedirects) {
+        try {
+            const parsed = new URL(currentUrl)
+            if (!isAllowedGoogleMapsHost(parsed.hostname)) {
+                // Destino no autorizado (protección SSRF)
+                return null
+            }
+
+            // Si la URL actual ya tiene coordenadas en sus parámetros o protobuf, no necesitamos seguir redirigiendo
+            if (extractCoordinatesFromResolvedUrl(currentUrl)) {
+                return currentUrl
+            }
+
+            // Si no es un acortador ni necesita resolución, retornar
+            const isShortener = parsed.hostname === 'maps.app.goo.gl' || parsed.hostname === 'goo.gl'
+            if (!isShortener && redirectCount > 0) {
+                return currentUrl
+            }
+
+            let response = null
+            try {
+                response = await fetchFn(currentUrl, {
+                    method: 'HEAD',
+                    redirect: 'manual',
+                    signal: AbortSignal.timeout(4000)
+                })
+            } catch (_) {
+                response = null
+            }
+
+            if (!response || response.status === 405 || (response.status >= 200 && response.status < 300 && !response.headers?.get?.('location'))) {
+                try {
+                    response = await fetchFn(currentUrl, {
+                        method: 'GET',
+                        redirect: 'manual',
+                        signal: AbortSignal.timeout(4000)
+                    })
+                } catch (_) {
+                    response = null
+                }
+            }
+
+            if (!response) return currentUrl
+
+            const status = response.status
+            if (status >= 300 && status < 400) {
+                const location = response.headers?.get ? response.headers.get('location') : null
+                if (!location) return currentUrl
+
+                const nextUrl = new URL(location, currentUrl).href
+                currentUrl = nextUrl
+                redirectCount++
+            } else if (status === 200) {
+                if (response.url && response.url !== currentUrl) {
+                    currentUrl = response.url
+                    if (extractCoordinatesFromResolvedUrl(currentUrl)) return currentUrl
+                }
+                if (typeof response.text === 'function') {
+                    try {
+                        const textBody = await response.text()
+                        const ogMatch = textBody.match(/property="og:url"\s+content="([^"]+)"/i) || textBody.match(/content="([^"]+)"\s+property="og:url"/i)
+                        if (ogMatch && ogMatch[1]) {
+                            return ogMatch[1]
+                        }
+                        const markerBodyMatch = textBody.match(/!3d(-?\d+(?:\.\d+)?).*?!4d(-?\d+(?:\.\d+)?)/)
+                        if (markerBodyMatch) {
+                            return textBody
+                        }
+                    } catch (_) { }
+                }
+                return currentUrl
+            } else {
+                return currentUrl
+            }
+        } catch (_) {
+            return null
+        }
+    }
+
+    return currentUrl
+}
+
+/**
+ * Orquestador para extraer coordenadas de un mensaje de texto con enlace de Google Maps
+ */
+async function extractCoordinatesFromGoogleMaps(text, customFetch = null) {
+    const foundUrl = extractGoogleMapsUrlFromText(text)
+    if (!foundUrl) return null
+
+    // 1. Intentar extracción directa si la URL ya contiene los parámetros
+    const directCoords = extractCoordinatesFromResolvedUrl(foundUrl)
+    if (directCoords) return directCoords
+
+    // 2. Si es enlace corto o requiere resolución, resolver con seguridad
+    const resolvedUrl = await resolveGoogleMapsUrl(foundUrl, customFetch)
+    if (!resolvedUrl) return null
+
+    return extractCoordinatesFromResolvedUrl(resolvedUrl)
+}
+
+// ==============================================================================
+// GESTIÓN DE ATENCIÓN MANUAL POR ASESOR Y DETECCIÓN DE MENSAJES SALIENTES
+// ==============================================================================
+
+if (!global.botSentMessageIds) global.botSentMessageIds = new Set()
+
+function recordBotOutgoingMessageId(msgId) {
+    if (!msgId || typeof msgId !== 'string') return
+    global.botSentMessageIds.add(msgId)
+    if (global.botSentMessageIds.size > 10000) {
+        const first = global.botSentMessageIds.values().next().value
+        global.botSentMessageIds.delete(first)
+    }
+    try {
+        db.prepare('INSERT OR IGNORE INTO bot_outgoing_messages (id) VALUES (?)').run(msgId)
+    } catch (_) {}
+}
+
+function isBotOutgoingMessageId(msgId) {
+    if (!msgId || typeof msgId !== 'string') return false
+    if (global.botSentMessageIds?.has(msgId)) return true
+    try {
+        const row = db.prepare('SELECT id FROM bot_outgoing_messages WHERE id = ?').get(msgId)
+        if (row) {
+            global.botSentMessageIds.add(msgId)
+            return true
+        }
+    } catch (_) {}
+    return false
+}
+
+function isAdvisorClosingMessage(text) {
+    if (!text || typeof text !== 'string') return false
+    const normalized = text
+        .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+        .toLowerCase()
+    return /gracias\s*[.,;!:]*\s*reporte\s+recibido/i.test(normalized)
+}
+
+function getAdvisorSession(userJid) {
+    if (!userJid) return null
+    try {
+        return db.prepare('SELECT user_jid, status, started_at, closed_at, closed_at_ms, last_activity_ms FROM advisor_sessions WHERE user_jid = ?').get(userJid) || null
+    } catch (_) {
+        return null
+    }
+}
+
+function activateAdvisorSession(userJid, activityMs = Date.now()) {
+    if (!userJid) return
+    try {
+        db.prepare(`
+            INSERT INTO advisor_sessions (user_jid, status, started_at, closed_at, closed_at_ms, last_activity_ms)
+            VALUES (?, 'ACTIVE', CURRENT_TIMESTAMP, NULL, NULL, ?)
+            ON CONFLICT(user_jid) DO UPDATE SET
+                status = 'ACTIVE',
+                closed_at = NULL,
+                closed_at_ms = NULL,
+                started_at = CURRENT_TIMESTAMP,
+                last_activity_ms = ?
+        `).run(userJid, activityMs, activityMs)
+    } catch (err) {
+        addLog('error', `Error al activar sesión de asesor para ${userJid}: ${err.message}`)
+    }
+}
+
+function touchAdvisorSessionActivity(userJid, activityMs = Date.now()) {
+    if (!userJid) return
+    try {
+        db.prepare("UPDATE advisor_sessions SET last_activity_ms = ? WHERE user_jid = ? AND status = 'ACTIVE'").run(activityMs, userJid)
+    } catch (_) { }
+}
+
+function isAdvisorSessionExpired(advisor) {
+    if (!advisor || advisor.status !== 'ACTIVE') return false
+    const lastActive = advisor.last_activity_ms || (advisor.started_at ? parseSessionUtcTimestamp(advisor.started_at) : 0)
+    if (!lastActive) return false
+    return (Date.now() - lastActive) >= ADVISOR_ACTIVE_TIMEOUT_MS
+}
+
+function closeAdvisorSession(userJid, closedAtMs = Date.now()) {
+    if (!userJid) return
+    try {
+        db.prepare(`
+            INSERT INTO advisor_sessions (user_jid, status, started_at, closed_at, closed_at_ms, last_activity_ms)
+            VALUES (?, 'COOLDOWN', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, ?, ?)
+            ON CONFLICT(user_jid) DO UPDATE SET
+                status = 'COOLDOWN',
+                closed_at = CURRENT_TIMESTAMP,
+                closed_at_ms = ?,
+                last_activity_ms = ?
+        `).run(userJid, closedAtMs, closedAtMs, closedAtMs, closedAtMs)
+    } catch (err) {
+        addLog('error', `Error al cerrar sesión de asesor para ${userJid}: ${err.message}`)
+    }
+}
+
+function clearAdvisorSession(userJid) {
+    if (!userJid) return
+    try {
+        db.prepare('DELETE FROM advisor_sessions WHERE user_jid = ?').run(userJid)
+    } catch (err) {
+        addLog('error', `Error al limpiar sesión de asesor para ${userJid}: ${err.message}`)
+    }
+}
+
+async function handleAdvisorOutgoingMessage(sock, recipientJid, msg) {
+    const rawMsg = getRawMessage(msg)
+    const text = (
+        rawMsg?.conversation ||
+        rawMsg?.extendedTextMessage?.text ||
+        rawMsg?.imageMessage?.caption ||
+        ''
+    ).trim()
+
+    // 1. Comprobar si es el mensaje de finalización ("Gracias. Reporte recibido")
+    if (isAdvisorClosingMessage(text)) {
+        closeAdvisorSession(recipientJid, Date.now())
+        addLog('info', `Atención manual finalizada por asesor para ${recipientJid}. Cooldown de 15 min activado.`)
+        return
+    }
+
+    // 2. Si es cualquier otro mensaje del asesor, activar modo asesor
+    defaultQueue.cancelForJid(recipientJid)
+    activateAdvisorSession(recipientJid)
+    addLog('info', `Modo asesor activado para ${recipientJid}. FloodBot silenciado.`)
+
+    // 3. Gestionar sesión conversacional previa
+    try {
+        const existingSession = db.prepare('SELECT state, photo_path, report_id FROM report_sessions WHERE user_jid = ?').get(recipientJid)
+        if (existingSession) {
+            if (!existingSession.report_id) {
+                // Borrador incompleto: descartar foto temporal y eliminar sesión
+                if (existingSession.photo_path) {
+                    safeDeleteUploadFile(existingSession.photo_path)
+                }
+                db.prepare('DELETE FROM report_sessions WHERE user_jid = ?').run(recipientJid)
+                addLog('info', `Borrador incompleto descartado para ${recipientJid} por inicio de atención manual.`)
+            } else {
+                // Reporte ya auto-guardado: conservar en SQLite/Supabase y solo cerrar diálogo conversacional
+                deleteSessionWithoutPhoto(recipientJid)
+                addLog('info', `Reporte confirmado ${existingSession.report_id} conservado para ${recipientJid}. Sesión conversacional transferida a asesor.`)
+            }
+        }
+    } catch (err) {
+        addLog('error', `Error al gestionar sesión previa durante activación de asesor: ${err.message}`)
+    }
+}
+
 // Envío de interfaz de confirmación de reporte (resumen + encuesta táctil o texto clásico)
 async function sendReportConfirmationInterface(sock, sender, currentSession, modeOverride = null) {
     const mode = modeOverride || CONFIRMATION_INTERFACE_MODE
@@ -819,7 +1244,7 @@ async function sendAffectationPoll(sock, sender) {
 }
 
 // Control del flujo conversacional para el reporte de inundaciones
-async function handleFloodReportFlow(sock, sender, msg) {
+async function handleFloodReportFlow(sock, sender, msg, customDependencies = null) {
     const rawMsg = getRawMessage(msg)
     if (!rawMsg) return false
 
@@ -844,11 +1269,60 @@ async function handleFloodReportFlow(sock, sender, msg) {
                 const parsed = JSON.parse(paramsJson)
                 messageContent = parsed.id || parsed.display_text || ''
             }
-        } catch (_) {}
+        } catch (_) { }
     }
 
     const text = messageContent.trim()
     const lowerText = text.toLowerCase()
+
+    // 1. Si el mensaje es saliente (fromMe: true)
+    if (msg.key?.fromMe) {
+        const msgId = msg.key?.id
+        // Si fue originado por FloodBot, ignorar eco
+        if (isBotOutgoingMessageId(msgId)) {
+            return false
+        }
+        // Si NO fue originado por el bot, fue escrito personalmente por el asesor desde su WhatsApp
+        await handleAdvisorOutgoingMessage(sock, sender, msg)
+        return true
+    }
+
+    // 2. Si la conversación está en atención manual por asesor o en cooldown de 15 minutos
+    const advisorSession = getAdvisorSession(sender)
+    if (advisorSession) {
+        if (advisorSession.status === 'ACTIVE') {
+            if (isAdvisorSessionExpired(advisorSession)) {
+                clearAdvisorSession(sender)
+                addLog('info', `⏰ Atención manual expirada por inactividad (>2h) para ${sender}. Reactivando flujo automático.`)
+            } else {
+                touchAdvisorSessionActivity(sender)
+                // Modo asesor activo: FloodBot permanece en silencio absoluto
+                addLog('info', `Mensaje de ciudadano en conversación con asesor (silenciado): ${sender}`)
+                return true
+            }
+        }
+
+        if (advisorSession.status === 'COOLDOWN') {
+            const elapsedMs = Date.now() - (advisorSession.closed_at_ms || 0)
+            const isWithin15Min = elapsedMs < (15 * 60 * 1000)
+
+            if (isWithin15Min) {
+                const isExplicitReport = lowerText === 'reportar' || lowerText.startsWith('reportar')
+                if (!isExplicitReport) {
+                    // Respuestas de cortesía ("Gracias", etc.): silencio sin reiniciar temporizador
+                    addLog('info', `Mensaje de ciudadano durante cooldown post-asesor (silenciado): ${sender}`)
+                    return true
+                }
+                // Si el ciudadano escribe REPORTAR: reactivación inmediata
+                clearAdvisorSession(sender)
+                addLog('info', `Comando REPORTAR recibido durante cooldown. Reactivando flujo automático para ${sender}`)
+            } else {
+                // Pasaron más de 15 minutos desde el cierre: limpiar cooldown y permitir activación habitual
+                clearAdvisorSession(sender)
+                addLog('info', `Cooldown de 15 min expirado para ${sender}. Reactivando flujo automático.`)
+            }
+        }
+    }
 
     // Debounce para evitar ráfagas repetidas
     if (!global.recentTriggers) global.recentTriggers = new Map()
@@ -857,6 +1331,7 @@ async function handleFloodReportFlow(sock, sender, msg) {
 
     // Helper para iniciar un reporte nuevo
     const startNewReport = async () => {
+        clearAdvisorSession(sender)
         const lastTrigger = global.recentTriggers.get(sender) || 0
         const now = Date.now()
         if (now - lastTrigger < 3000) return true
@@ -927,8 +1402,9 @@ async function handleFloodReportFlow(sock, sender, msg) {
         return await startNewReport()
     }
 
-    // Iniciar con comando explícito
-    if (lowerText === 'reportar' || lowerText.includes('inundacion') || lowerText.includes('inundación')) {
+    // Iniciar con comando explícito (salvo que sea un enlace de ubicación dentro de una sesión activa)
+    const hasGoogleMapsUrl = extractGoogleMapsUrlFromText(text)
+    if (!hasGoogleMapsUrl && (lowerText === 'reportar' || lowerText.includes('inundacion') || lowerText.includes('inundación'))) {
         return await startNewReport()
     }
 
@@ -998,7 +1474,7 @@ async function handleFloodReportFlow(sock, sender, msg) {
                                     voterCandidates.add(`${pn}:0@s.whatsapp.net`)
                                 }
                             }
-                        } catch (_) {}
+                        } catch (_) { }
 
                         const voterAuthor = getKeyAuthor(msg.key, sock.user?.id)
                         if (voterAuthor) {
@@ -1100,14 +1576,30 @@ async function handleFloodReportFlow(sock, sender, msg) {
         return true
     }
 
-    // 2. Estado: AWAITING_LOCATION (Ubicación GPS obligatoria)
+    // 2. Estado: AWAITING_LOCATION (Ubicación GPS obligatoria: nativa o Google Maps)
     if (session.state === 'AWAITING_LOCATION') {
+        let lat = null
+        let lng = null
+
         const locationObj = rawMsg.locationMessage || rawMsg.liveLocationMessage
 
         if (locationObj && typeof locationObj.degreesLatitude === 'number' && typeof locationObj.degreesLongitude === 'number') {
-            const lat = locationObj.degreesLatitude
-            const lng = locationObj.degreesLongitude
+            lat = locationObj.degreesLatitude
+            lng = locationObj.degreesLongitude
+        } else if (text.length > 0 && extractGoogleMapsUrlFromText(text)) {
+            const coords = await extractCoordinatesFromGoogleMaps(text, customDependencies?.fetch)
+            if (coords) {
+                lat = coords.lat
+                lng = coords.lng
+            } else {
+                const invalidLinkMsg = `⚠️ No pudimos obtener una ubicación precisa de ese enlace de Google Maps.\n\nPor favor, compartí tu ubicación directamente usando la opción de WhatsApp (📎 > Ubicación).\n\nPara cancelar el reporte, escribí *0*.`
+                db.prepare('UPDATE report_sessions SET updated_at = CURRENT_TIMESTAMP WHERE user_jid = ?').run(sender)
+                await sendQueuedMessage(sock, sender, { text: invalidLinkMsg })
+                return true
+            }
+        }
 
+        if (lat !== null && lng !== null && isValidCoordinate(lat, lng)) {
             db.prepare(`
                 UPDATE report_sessions
                 SET state = 'AWAITING_PHOTO',
@@ -1417,19 +1909,19 @@ async function connectToWhatsApp() {
     // Guardado automático de credenciales actualizadas
     sock.ev.on('creds.update', saveCreds)
 
-    // Manejador de mensajes entrantes
+    // Manejador de mensajes entrantes y eventos de sincronización
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
-        // Ignorar eventos que no sean notificaciones de mensajes entrantes en vivo
-        if (type !== 'notify') return
+        // Ignorar eventos que no sean notificaciones en vivo
+        if (type !== 'notify' && type !== 'append') return
 
         const nowSec = Math.floor(Date.now() / 1000)
 
         for (const msg of messages) {
-            if (!msg.message || msg.key.fromMe) continue
+            if (!msg.message) continue
 
             const sender = msg.key.remoteJid
-            // Solo procesar mensajes de usuarios individuales (ignorar grupos y broadcast)
-            if (sender.endsWith('@g.us') || sender.endsWith('@broadcast')) continue
+            // Solo procesar mensajes de usuarios individuales (ignorar grupos, broadcast y canales)
+            if (sender.endsWith('@g.us') || sender.endsWith('@broadcast') || sender.endsWith('@newsletter')) continue
 
             // Protección contra mensajes antiguos encolados o duplicados durante reconexión
             // Si el mensaje tiene más de 5 minutos de antigüedad respecto a la hora actual, se descarta
@@ -1460,7 +1952,7 @@ async function connectToWhatsApp() {
 function closeDatabase() {
     try {
         db.close()
-    } catch (_) {}
+    } catch (_) { }
 }
 
 // Exportación para suite de pruebas
@@ -1491,6 +1983,23 @@ if (process.env.NODE_ENV === 'test') {
         getReportSummaryText,
         defaultQueue,
         sendQueuedMessage,
+        isValidCoordinate,
+        isAllowedGoogleMapsHost,
+        extractGoogleMapsUrlFromText,
+        extractCoordinatesFromResolvedUrl,
+        resolveGoogleMapsUrl,
+        extractCoordinatesFromGoogleMaps,
+        recordBotOutgoingMessageId,
+        isBotOutgoingMessageId,
+        isAdvisorClosingMessage,
+        getAdvisorSession,
+        activateAdvisorSession,
+        closeAdvisorSession,
+        clearAdvisorSession,
+        handleAdvisorOutgoingMessage,
+        touchAdvisorSessionActivity,
+        isAdvisorSessionExpired,
+        ADVISOR_ACTIVE_TIMEOUT_MS,
         DECISION_INTERFACE_MODE: null,
         sendContinueOrCancelInterface: null,
         EXPERIMENTAL_BUTTONS_ENABLED: false,

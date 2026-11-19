@@ -67,6 +67,24 @@ class MessageQueue {
     }
 
     /**
+     * Cancela y purga los mensajes encolados para un destinatario específico
+     * (por ejemplo, ante la intervención manual de un asesor humano).
+     * @param {string} jid - Destinatario cuyos mensajes pendientes deben cancelarse.
+     */
+    cancelForJid(jid) {
+        if (!jid) return
+        this.queue = this.queue.filter(item => {
+            if (item.jid === jid) {
+                if (typeof item.resolve === 'function') {
+                    item.resolve({ cancelled: true, reason: 'CANCELLED_BY_MANUAL_INTERVENTION' })
+                }
+                return false
+            }
+            return true
+        })
+    }
+
+    /**
      * Encola un mensaje para ser enviado a través del socket activo respetando el Rate Limiting.
      * NO guarda referencias fijas a sockets obsoletos; utiliza siempre el socket activo en el momento del envío.
      *

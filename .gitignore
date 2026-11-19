@@ -17,6 +17,9 @@ auth_info_baileys_respaldo/
 
 # Uploads
 uploads/
+test_sim/
+test_sim_web/
+test_tmp/
 
 # Environment files
 .env

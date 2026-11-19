@@ -69,7 +69,21 @@ const {
     AFFECTATION_CATEGORIES,
     FINAL_SUCCESS_MESSAGE,
     defaultQueue,
-    sendQueuedMessage
+    sendQueuedMessage,
+    isValidCoordinate,
+    isAllowedGoogleMapsHost,
+    extractGoogleMapsUrlFromText,
+    extractCoordinatesFromResolvedUrl,
+    resolveGoogleMapsUrl,
+    extractCoordinatesFromGoogleMaps,
+    recordBotOutgoingMessageId,
+    isBotOutgoingMessageId,
+    isAdvisorClosingMessage,
+    getAdvisorSession,
+    activateAdvisorSession,
+    closeAdvisorSession,
+    clearAdvisorSession,
+    handleAdvisorOutgoingMessage
 } = require('./bot')
 const { MessageQueue } = require('./messageQueue')
 
@@ -1473,10 +1487,600 @@ async function runTests() {
         passedTests++
 
         // --------------------------------------------------------------------------
+        // Test 32: Ubicación nativa de WhatsApp se mantiene 100% operativa e intacta
+        // --------------------------------------------------------------------------
+        console.log('▶️ Test 32: Ubicación nativa de WhatsApp se mantiene 100% operativa...')
+        const userNativeLoc = '595989990032@s.whatsapp.net'
+        deleteSession(userNativeLoc)
+        const mockSock32 = createMockSocket()
+
+        db.prepare(`
+            INSERT INTO report_sessions (user_jid, state, latitude, longitude, updated_at)
+            VALUES (?, 'AWAITING_LOCATION', NULL, NULL, datetime('now'))
+        `).run(userNativeLoc)
+
+        // Enviar ubicación nativa de Baileys
+        await handleFloodReportFlow(mockSock32, userNativeLoc, {
+            key: { remoteJid: userNativeLoc, id: 'MSG_T32_NATIVE' },
+            message: { locationMessage: { degreesLatitude: -25.299045, degreesLongitude: -57.532044 } }
+        })
+
+        const session32 = db.prepare('SELECT state, latitude, longitude FROM report_sessions WHERE user_jid = ?').get(userNativeLoc)
+        assert.strictEqual(session32.state, 'AWAITING_PHOTO', 'Debe pasar a AWAITING_PHOTO')
+        assert.strictEqual(session32.latitude, -25.299045, 'Latitud nativa debe guardarse correctamente')
+        assert.strictEqual(session32.longitude, -57.532044, 'Longitud nativa debe guardarse correctamente')
+        assert.ok(mockSock32.sentMessages[0].content.text.includes('Ubicación recibida con éxito'), 'Debe enviar confirmación con coordenadas')
+        assert.ok(mockSock32.sentMessages[0].content.text.includes('-25.299045, -57.532044'))
+        console.log('  ✅ Test 32 aprobado: Ubicación nativa de WhatsApp 100% operativa e idéntica.\n')
+        passedTests++
+
+        // --------------------------------------------------------------------------
+        // Test 33: Enlace directo de Google Maps con coordenadas en parámetros (?q=lat,lng)
+        // --------------------------------------------------------------------------
+        console.log('▶️ Test 33: Enlace directo de Google Maps con coordenadas en query (?q=lat,lng)...')
+        const userGmapsQuery = '595989990033@s.whatsapp.net'
+        deleteSession(userGmapsQuery)
+        const mockSock33 = createMockSocket()
+
+        db.prepare(`
+            INSERT INTO report_sessions (user_jid, state, latitude, longitude, updated_at)
+            VALUES (?, 'AWAITING_LOCATION', NULL, NULL, datetime('now'))
+        `).run(userGmapsQuery)
+
+        // Enlace directo en texto
+        await handleFloodReportFlow(mockSock33, userGmapsQuery, {
+            key: { remoteJid: userGmapsQuery, id: 'MSG_T33_GMAPS' },
+            message: { conversation: 'Inundación en esta zona: https://www.google.com/maps?q=-25.299045,-57.532044' }
+        })
+
+        const session33 = db.prepare('SELECT state, latitude, longitude FROM report_sessions WHERE user_jid = ?').get(userGmapsQuery)
+        assert.strictEqual(session33.state, 'AWAITING_PHOTO', 'Debe pasar a AWAITING_PHOTO')
+        assert.strictEqual(session33.latitude, -25.299045, 'Latitud de query de Google Maps debe guardarse')
+        assert.strictEqual(session33.longitude, -57.532044, 'Longitud de query de Google Maps debe guardarse')
+        assert.ok(mockSock33.sentMessages[0].content.text.includes('Ubicación recibida con éxito'))
+        console.log('  ✅ Test 33 aprobado: Coordenadas extraídas de parámetro de búsqueda de Google Maps.\n')
+        passedTests++
+
+        // --------------------------------------------------------------------------
+        // Test 34: Priorización de marcador seleccionado (!3d/!4d) sobre centro de cámara (@lat,lng)
+        // --------------------------------------------------------------------------
+        console.log('▶️ Test 34: Priorización de marcador (!3d/!4d) sobre centro de cámara (@lat,lng)...')
+        const userMarkerGmaps = '595989990034@s.whatsapp.net'
+        deleteSession(userMarkerGmaps)
+        const mockSock34 = createMockSocket()
+
+        db.prepare(`
+            INSERT INTO report_sessions (user_jid, state, latitude, longitude, updated_at)
+            VALUES (?, 'AWAITING_LOCATION', NULL, NULL, datetime('now'))
+        `).run(userMarkerGmaps)
+
+        // URL con centro de cámara en (-25.280000, -57.630000) pero marcador en (-25.281543, -57.635921)
+        const urlWithMarkerAndCamera = 'https://www.google.com/maps/place/Costanera+Asuncion/@-25.280000,-57.630000,15z/data=!3m1!4b1!4m6!3m5!1s0x0:0x0!8m2!3d-25.281543!4d-57.635921'
+
+        await handleFloodReportFlow(mockSock34, userMarkerGmaps, {
+            key: { remoteJid: userMarkerGmaps, id: 'MSG_T34_MARKER' },
+            message: { conversation: `Acá está el desborde: ${urlWithMarkerAndCamera}` }
+        })
+
+        const session34 = db.prepare('SELECT state, latitude, longitude FROM report_sessions WHERE user_jid = ?').get(userMarkerGmaps)
+        assert.strictEqual(session34.state, 'AWAITING_PHOTO')
+        // Debe ser el marcador seleccionado, NO el centro de la cámara
+        assert.strictEqual(session34.latitude, -25.281543, 'Debe extraer latitud del marcador (!3d), no de la cámara')
+        assert.strictEqual(session34.longitude, -57.635921, 'Debe extraer longitud del marcador (!4d), no de la cámara')
+        console.log('  ✅ Test 34 aprobado: Coordenadas del marcador priorizadas sobre el centro de cámara.\n')
+        passedTests++
+
+        // --------------------------------------------------------------------------
+        // Test 35: Rechazo estricto de URLs que solo contienen centro de cámara (/@lat,lng) sin marcador
+        // --------------------------------------------------------------------------
+        console.log('▶️ Test 35: Rechazo estricto de URLs que solo contienen centro de cámara sin marcador...')
+        const userCameraOnly = '595989990035@s.whatsapp.net'
+        deleteSession(userCameraOnly)
+        const mockSock35 = createMockSocket()
+
+        db.prepare(`
+            INSERT INTO report_sessions (user_jid, state, latitude, longitude, updated_at)
+            VALUES (?, 'AWAITING_LOCATION', NULL, NULL, datetime('now'))
+        `).run(userCameraOnly)
+
+        // URL que solo tiene la vista de cámara (@lat,lng,z) sin ningún pin o búsqueda
+        const cameraOnlyUrl = 'https://www.google.com/maps/@-25.280000,-57.630000,15z'
+
+        await handleFloodReportFlow(mockSock35, userCameraOnly, {
+            key: { remoteJid: userCameraOnly, id: 'MSG_T35_CAMERA' },
+            message: { conversation: cameraOnlyUrl }
+        })
+
+        const session35 = db.prepare('SELECT state, latitude, longitude FROM report_sessions WHERE user_jid = ?').get(userCameraOnly)
+        // No debe avanzar a AWAITING_PHOTO porque la cámara no es un marcador de incidente
+        assert.strictEqual(session35.state, 'AWAITING_LOCATION', 'La sesión debe mantenerse en AWAITING_LOCATION')
+        assert.strictEqual(session35.latitude, null)
+        assert.strictEqual(session35.longitude, null)
+        assert.ok(mockSock35.sentMessages[0].content.text.includes('No pudimos obtener una ubicación precisa'), 'Debe solicitar ubicación de WhatsApp')
+        console.log('  ✅ Test 35 aprobado: Centro de cámara aislado rechazado sin cancelar reporte.\n')
+        passedTests++
+
+        // --------------------------------------------------------------------------
+        // Test 36: Enlace corto maps.app.goo.gl resuelto mediante redirección segura
+        // --------------------------------------------------------------------------
+        console.log('▶️ Test 36: Enlace corto maps.app.goo.gl resuelto mediante redirección segura...')
+        const userShortGmaps = '595989990036@s.whatsapp.net'
+        deleteSession(userShortGmaps)
+        const mockSock36 = createMockSocket()
+
+        db.prepare(`
+            INSERT INTO report_sessions (user_jid, state, latitude, longitude, updated_at)
+            VALUES (?, 'AWAITING_LOCATION', NULL, NULL, datetime('now'))
+        `).run(userShortGmaps)
+
+        // Mock de fetch que simula redirección HTTP 302 hacia URL expandida con marcador
+        const mockShortFetch = async (url) => {
+            if (url === 'https://maps.app.goo.gl/AbCd1234') {
+                return {
+                    status: 302,
+                    headers: {
+                        get: (h) => h.toLowerCase() === 'location' ? 'https://www.google.com/maps/place/Barrio+San+Pablo/@-25.3200,-57.6000,16z/data=!3m1!4b1!4m6!3m5!1s0x0:0x0!8m2!3d-25.321456!4d-57.602345' : null
+                    }
+                }
+            }
+            return { status: 404 }
+        }
+
+        await handleFloodReportFlow(mockSock36, userShortGmaps, {
+            key: { remoteJid: userShortGmaps, id: 'MSG_T36_SHORT' },
+            message: { conversation: 'https://maps.app.goo.gl/AbCd1234' }
+        }, { fetch: mockShortFetch })
+
+        const session36 = db.prepare('SELECT state, latitude, longitude FROM report_sessions WHERE user_jid = ?').get(userShortGmaps)
+        assert.strictEqual(session36.state, 'AWAITING_PHOTO')
+        assert.strictEqual(session36.latitude, -25.321456, 'Latitud resuelta desde enlace corto debe ser la del marcador')
+        assert.strictEqual(session36.longitude, -57.602345, 'Longitud resuelta desde enlace corto debe ser la del marcador')
+        console.log('  ✅ Test 36 aprobado: Enlace corto maps.app.goo.gl resuelto y procesado correctamente.\n')
+        passedTests++
+
+        // --------------------------------------------------------------------------
+        // Test 37: Seguridad y protección SSRF: Bloqueo de dominios no autorizados
+        // --------------------------------------------------------------------------
+        console.log('▶️ Test 37: Seguridad y protección SSRF: Bloqueo de dominios no autorizados...')
+        const userSsrf = '595989990037@s.whatsapp.net'
+        deleteSession(userSsrf)
+        const mockSock37 = createMockSocket()
+
+        db.prepare(`
+            INSERT INTO report_sessions (user_jid, state, latitude, longitude, updated_at)
+            VALUES (?, 'AWAITING_LOCATION', NULL, NULL, datetime('now'))
+        `).run(userSsrf)
+
+        let ssrfFetchCalled = false
+        const spySsrfFetch = async () => {
+            ssrfFetchCalled = true
+            return { status: 200 }
+        }
+
+        // Intento de enlace con dominio malicioso o IP interna
+        await handleFloodReportFlow(mockSock37, userSsrf, {
+            key: { remoteJid: userSsrf, id: 'MSG_T37_SSRF' },
+            message: { conversation: 'http://malicious-site.com/maps?q=-25.29,-57.53' }
+        }, { fetch: spySsrfFetch })
+
+        assert.strictEqual(ssrfFetchCalled, false, 'NUNCA debe realizarse petición HTTP a dominios ajenos a Google')
+        const session37 = db.prepare('SELECT state, latitude, longitude FROM report_sessions WHERE user_jid = ?').get(userSsrf)
+        assert.strictEqual(session37.state, 'AWAITING_LOCATION', 'Debe permanecer en AWAITING_LOCATION')
+        assert.strictEqual(session37.latitude, null)
+        assert.ok(mockSock37.sentMessages[0].content.text.includes('compartí la ubicación del lugar afectado'))
+        console.log('  ✅ Test 37 aprobado: Protección SSRF confirmada; dominios no autorizados bloqueados.\n')
+        passedTests++
+
+        // --------------------------------------------------------------------------
+        // Test 38: Enlace de Google Maps sin coordenadas: solicitud de ubicación nativa sin cancelar
+        // --------------------------------------------------------------------------
+        console.log('▶️ Test 38: Enlace de Google Maps sin coordenadas: solicitud de ubicación nativa...')
+        const userNoCoords = '595989990038@s.whatsapp.net'
+        deleteSession(userNoCoords)
+        const mockSock38 = createMockSocket()
+
+        db.prepare(`
+            INSERT INTO report_sessions (user_jid, state, latitude, longitude, updated_at)
+            VALUES (?, 'AWAITING_LOCATION', NULL, NULL, datetime('now'))
+        `).run(userNoCoords)
+
+        // Enlace de búsqueda genérica de Google Maps sin coordenadas numéricas
+        await handleFloodReportFlow(mockSock38, userNoCoords, {
+            key: { remoteJid: userNoCoords, id: 'MSG_T38_NO_COORDS' },
+            message: { conversation: 'https://www.google.com/maps/search/asuncion+paraguay' }
+        })
+
+        const session38 = db.prepare('SELECT state, latitude, longitude FROM report_sessions WHERE user_jid = ?').get(userNoCoords)
+        assert.strictEqual(session38.state, 'AWAITING_LOCATION', 'No debe cancelar la sesión; debe permanecer en AWAITING_LOCATION')
+        assert.strictEqual(session38.latitude, null)
+        assert.ok(mockSock38.sentMessages[0].content.text.includes('No pudimos obtener una ubicación precisa'))
+        console.log('  ✅ Test 38 aprobado: Enlace sin coordenadas solicita ubicación nativa sin alterar estado.\n')
+        passedTests++
+
+        // --------------------------------------------------------------------------
+        // Test 39: Validación geográfica estricta: Coordenadas fuera de rango rechazadas
+        // --------------------------------------------------------------------------
+        console.log('▶️ Test 39: Validación geográfica estricta: Coordenadas fuera de rango rechazadas...')
+        const userOutOfBounds = '595989990039@s.whatsapp.net'
+        deleteSession(userOutOfBounds)
+        const mockSock39 = createMockSocket()
+
+        db.prepare(`
+            INSERT INTO report_sessions (user_jid, state, latitude, longitude, updated_at)
+            VALUES (?, 'AWAITING_LOCATION', NULL, NULL, datetime('now'))
+        `).run(userOutOfBounds)
+
+        // Latitud inválida > 90
+        await handleFloodReportFlow(mockSock39, userOutOfBounds, {
+            key: { remoteJid: userOutOfBounds, id: 'MSG_T39_OOB' },
+            message: { conversation: 'https://www.google.com/maps?q=125.0000,-57.0000' }
+        })
+
+        const session39 = db.prepare('SELECT state, latitude, longitude FROM report_sessions WHERE user_jid = ?').get(userOutOfBounds)
+        assert.strictEqual(session39.state, 'AWAITING_LOCATION')
+        assert.strictEqual(session39.latitude, null)
+        assert.ok(mockSock39.sentMessages[0].content.text.includes('No pudimos obtener una ubicación precisa'))
+        console.log('  ✅ Test 39 aprobado: Coordenadas fuera de rango rechazadas correctamente.\n')
+        passedTests++
+
+        // --------------------------------------------------------------------------
+        // Test 40: Un mensaje automático de FloodBot no activa el modo asesor
+        // --------------------------------------------------------------------------
+        console.log('▶️ Test 40: Mensaje automático del bot no activa modo asesor (eco ignorado)...')
+        const userT40 = '595989990040@s.whatsapp.net'
+        const botMsgId = 'BOT_TEST_ID_40'
+        recordBotOutgoingMessageId(botMsgId)
+
+        const mockSock40 = createMockSocket()
+        // Simular eco de Baileys de un mensaje que el bot mismo envió
+        const handled40 = await handleFloodReportFlow(mockSock40, userT40, {
+            key: { remoteJid: userT40, id: botMsgId, fromMe: true },
+            message: { conversation: 'Mensaje saliente del bot' }
+        })
+
+        assert.strictEqual(handled40, false, 'El eco del propio bot debe ser ignorado')
+        const advisorSess40 = getAdvisorSession(userT40)
+        assert.strictEqual(advisorSess40, null, 'No debe crearse sesión de asesor ante eco del bot')
+        console.log('  ✅ Test 40 aprobado: Ecos del propio bot no activan modo asesor.\n')
+        passedTests++
+
+        // --------------------------------------------------------------------------
+        // Test 41: Un mensaje enviado manualmente desde WhatsApp activa el modo asesor
+        // --------------------------------------------------------------------------
+        console.log('▶️ Test 41: Mensaje manual desde WhatsApp del asesor activa modo asesor...')
+        const userT41 = '595989990041@s.whatsapp.net'
+        deleteSession(userT41)
+        clearAdvisorSession(userT41)
+
+        const mockSock41 = createMockSocket()
+        // Mensaje manual enviado por el asesor (fromMe: true, ID no perteneciente al bot)
+        const handled41 = await handleFloodReportFlow(mockSock41, userT41, {
+            key: { remoteJid: userT41, id: '3EB0_MANUAL_PHONE_41', fromMe: true },
+            message: { conversation: 'Hola, te habla un asesor. Voy a ayudarte con tu reporte.' }
+        })
+
+        assert.strictEqual(handled41, true, 'Debe procesar la intervención manual')
+        const advisorSess41 = getAdvisorSession(userT41)
+        assert.ok(advisorSess41, 'Debe existir sesión de asesor en SQLite')
+        assert.strictEqual(advisorSess41.status, 'ACTIVE', 'El estado debe ser ACTIVE')
+        assert.strictEqual(mockSock41.sentMessages.length, 0, 'No debe enviar ningún mensaje adicional al activar modo asesor')
+        console.log('  ✅ Test 41 aprobado: Mensaje manual activa modo asesor silenciosamente.\n')
+        passedTests++
+
+        // --------------------------------------------------------------------------
+        // Test 42: FloodBot permanece en silencio absoluto durante la atención manual
+        // --------------------------------------------------------------------------
+        console.log('▶️ Test 42: Silencio absoluto durante la atención manual...')
+        // Ciudadano escribe a la conversación donde el asesor está activo
+        const mockSock42 = createMockSocket()
+        await handleFloodReportFlow(mockSock42, userT41, {
+            key: { remoteJid: userT41, id: 'MSG_CITIZEN_42_1' },
+            message: { conversation: 'Hola asesor, el agua está entrando a mi sala.' }
+        })
+
+        // Ciudadano envía otro mensaje
+        await handleFloodReportFlow(mockSock42, userT41, {
+            key: { remoteJid: userT41, id: 'MSG_CITIZEN_42_2' },
+            message: { conversation: '¿Cuánto van a tardar?' }
+        })
+
+        assert.strictEqual(mockSock42.sentMessages.length, 0, 'FloodBot debe permanecer completamente mudo')
+        console.log('  ✅ Test 42 aprobado: FloodBot silenciado ante mensajes del ciudadano.\n')
+        passedTests++
+
+        // --------------------------------------------------------------------------
+        // Test 43: Los demás ciudadanos siguen siendo atendidos normalmente en paralelo
+        // --------------------------------------------------------------------------
+        console.log('▶️ Test 43: Aislamiento: Otros ciudadanos son atendidos normalmente...')
+        const userOther = '595989990043@s.whatsapp.net'
+        deleteSession(userOther)
+        clearAdvisorSession(userOther)
+
+        const mockSock43 = createMockSocket()
+        // Otro ciudadano inicia reporte con FloodBot
+        await handleFloodReportFlow(mockSock43, userOther, {
+            key: { remoteJid: userOther, id: 'MSG_OTHER_43' },
+            message: { conversation: 'REPORTAR' }
+        })
+
+        assert.ok(mockSock43.sentMessages.length >= 2, 'El otro usuario debe recibir bienvenida y ubicación')
+        assert.ok(mockSock43.sentMessages[0].content.text.includes('Sistema de Monitoreo de Inundaciones'))
+        const sessOther = db.prepare('SELECT state FROM report_sessions WHERE user_jid = ?').get(userOther)
+        assert.strictEqual(sessOther.state, 'AWAITING_LOCATION', 'Sesión automática del otro usuario opera con normalidad')
+        console.log('  ✅ Test 43 aprobado: Aislamiento confirmado; otros ciudadanos operan sin afectación.\n')
+        passedTests++
+
+        // --------------------------------------------------------------------------
+        // Test 44: Los reportes atendidos manualmente NO se guardan en Supabase
+        // --------------------------------------------------------------------------
+        console.log('▶️ Test 44: Conversaciones manuales no generan reportes en Supabase...')
+        const pendingManual = db.prepare('SELECT * FROM pending_sync_reports WHERE user_jid = ?').all(userT41)
+        assert.strictEqual(pendingManual.length, 0, 'No debe existir ningún reporte en cola/Supabase para la sesión manual')
+        console.log('  ✅ Test 44 aprobado: Cero registros generados en cola o Supabase para chats manuales.\n')
+        passedTests++
+
+        // --------------------------------------------------------------------------
+        // Test 45: Mensaje "Gracias. Reporte recibido" finaliza la atención manual e inicia cooldown
+        // --------------------------------------------------------------------------
+        console.log('▶️ Test 45: Mensaje de cierre finaliza atención manual e inicia cooldown de 15m...')
+        const mockSock45 = createMockSocket()
+        // Asesor envía mensaje de cierre con variaciones de puntuación y texto
+        const closingMsgText = 'Gracias. Reporte recibido.\n\nTu reporte ha sido recibido correctamente.\nSi querés realizar otro reporte, escribí REPORTAR.'
+        await handleFloodReportFlow(mockSock45, userT41, {
+            key: { remoteJid: userT41, id: '3EB0_CLOSING_45', fromMe: true },
+            message: { conversation: closingMsgText }
+        })
+
+        assert.strictEqual(mockSock45.sentMessages.length, 0, 'FloodBot no debe duplicar el mensaje de cierre')
+        const advisorSess45 = getAdvisorSession(userT41)
+        assert.ok(advisorSess45, 'Debe seguir existiendo registro en advisor_sessions')
+        assert.strictEqual(advisorSess45.status, 'COOLDOWN', 'El estado debe cambiar a COOLDOWN')
+        assert.ok(advisorSess45.closed_at_ms > 0, 'Debe registrar closed_at_ms')
+        console.log('  ✅ Test 45 aprobado: Cierre reconocido y transición a cooldown de 15 min.\n')
+        passedTests++
+
+        // --------------------------------------------------------------------------
+        // Test 46: Ciudadano responde "Gracias" durante los 15 minutos de cooldown sin respuesta del bot
+        // --------------------------------------------------------------------------
+        console.log('▶️ Test 46: Ciudadano responde "Gracias" durante cooldown (bot silenciado sin reiniciar timer)...')
+        const mockSock46 = createMockSocket()
+        const closedAtBefore = getAdvisorSession(userT41).closed_at_ms
+
+        await handleFloodReportFlow(mockSock46, userT41, {
+            key: { remoteJid: userT41, id: 'MSG_THANKS_46' },
+            message: { conversation: 'Muchas gracias por la atención, buenas noches!' }
+        })
+
+        assert.strictEqual(mockSock46.sentMessages.length, 0, 'El bot debe permanecer silenciado durante los 15 min de cooldown')
+        const closedAtAfter = getAdvisorSession(userT41).closed_at_ms
+        assert.strictEqual(closedAtBefore, closedAtAfter, 'Los mensajes de cortesía no deben reiniciar el temporizador')
+        console.log('  ✅ Test 46 aprobado: Cortesías durante cooldown silenciadas sin alterar temporizador.\n')
+        passedTests++
+
+        // --------------------------------------------------------------------------
+        // Test 47: Ciudadano escribe REPORTAR durante cooldown e inicia nuevo reporte inmediato
+        // --------------------------------------------------------------------------
+        console.log('▶️ Test 47: Ciudadano escribe REPORTAR durante cooldown (reactivación inmediata)...')
+        const mockSock47 = createMockSocket()
+        await handleFloodReportFlow(mockSock47, userT41, {
+            key: { remoteJid: userT41, id: 'MSG_REPORTAR_47' },
+            message: { conversation: 'REPORTAR' }
+        })
+
+        assert.ok(mockSock47.sentMessages.length >= 2, 'Debe responder inmediatamente con bienvenida y ubicación')
+        assert.ok(mockSock47.sentMessages[0].content.text.includes('Sistema de Monitoreo de Inundaciones'))
+        const advisorSess47 = getAdvisorSession(userT41)
+        assert.strictEqual(advisorSess47, null, 'La sesión de asesor debe haberse limpiado')
+        const reportSess47 = db.prepare('SELECT state FROM report_sessions WHERE user_jid = ?').get(userT41)
+        assert.strictEqual(reportSess47.state, 'AWAITING_LOCATION', 'Debe iniciar reporte automático en AWAITING_LOCATION')
+        console.log('  ✅ Test 47 aprobado: Comando REPORTAR durante cooldown reactiva el bot al instante.\n')
+        passedTests++
+
+        // --------------------------------------------------------------------------
+        // Test 48: Después de 15 minutos desde el cierre, cualquier mensaje activa el flujo automático
+        // --------------------------------------------------------------------------
+        console.log('▶️ Test 48: Tras 15 minutos desde el cierre, cualquier mensaje reactiva el bot...')
+        const userT48 = '595989990048@s.whatsapp.net'
+        deleteSession(userT48)
+        clearAdvisorSession(userT48)
+
+        // Asesor intervino y luego cerró hace 16 minutos (> 15 minutos)
+        const sixteenMinAgo48 = Date.now() - (16 * 60 * 1000)
+        closeAdvisorSession(userT48, sixteenMinAgo48)
+
+        const mockSock48 = createMockSocket()
+        // Ciudadano escribe cualquier mensaje ordinario ("Hola")
+        await handleFloodReportFlow(mockSock48, userT48, {
+            key: { remoteJid: userT48, id: 'MSG_T48_GREET' },
+            message: { conversation: 'Hola' }
+        })
+
+        assert.ok(mockSock48.sentMessages.length >= 2, 'Cualquier mensaje tras 15 min debe iniciar el flujo habitual')
+        assert.ok(mockSock48.sentMessages[0].content.text.includes('Sistema de Monitoreo de Inundaciones'))
+        const advisorSess48 = getAdvisorSession(userT48)
+        assert.strictEqual(advisorSess48, null, 'El registro de asesor en cooldown debe quedar limpio')
+        console.log('  ✅ Test 48 aprobado: Expiración de cooldown de 15m reactiva el flujo habitual.\n')
+        passedTests++
+
+        // --------------------------------------------------------------------------
+        // Test 49: Persistencia y resiliencia ante reinicios de servidor
+        // --------------------------------------------------------------------------
+        console.log('▶️ Test 49: Persistencia en SQLite sobrevive a reinicios de servidor...')
+        const userT49 = '595989990049@s.whatsapp.net'
+        clearAdvisorSession(userT49)
+        activateAdvisorSession(userT49)
+
+        // Simular reinicio: limpiar memoria global
+        global.botSentMessageIds = new Set()
+        global.recentTriggers = new Map()
+
+        // Verificar que en SQLite sigue activo
+        const sess49FromDb = getAdvisorSession(userT49)
+        assert.strictEqual(sess49FromDb.status, 'ACTIVE', 'El estado ACTIVE debe persistir en SQLite')
+
+        // Mensaje recibido tras reinicio: debe seguir silenciado
+        const mockSock49 = createMockSocket()
+        await handleFloodReportFlow(mockSock49, userT49, {
+            key: { remoteJid: userT49, id: 'MSG_T49_AFTER_REBOOT' },
+            message: { conversation: '¿Siguen ahí?' }
+        })
+
+        assert.strictEqual(mockSock49.sentMessages.length, 0, 'Debe permanecer silenciado aún tras reinicio')
+        console.log('  ✅ Test 49 aprobado: Estado persistente en SQLite blindado ante reinicios.\n')
+        passedTests++
+
+        // --------------------------------------------------------------------------
+        // Test 50: El cierre automático por inactividad de reportes normales sigue funcionando
+        // --------------------------------------------------------------------------
+        console.log('▶️ Test 50: Cierre por inactividad de reportes normales intacto (modo asesor protegido)...')
+        const userNormalExp = '595989990050@s.whatsapp.net'
+        deleteSession(userNormalExp)
+        clearAdvisorSession(userNormalExp)
+
+        // Usuario normal con borrador expirado (>16 min)
+        db.prepare(`
+            INSERT INTO report_sessions (user_jid, state, latitude, longitude, updated_at)
+            VALUES (?, 'AWAITING_LOCATION', NULL, NULL, datetime('now', '-16 minutes'))
+        `).run(userNormalExp)
+
+        // Usuario en modo asesor que también lleva 16 min inactivo
+        const userAdvisorProtected = '595989990051@s.whatsapp.net'
+        deleteSession(userAdvisorProtected)
+        clearAdvisorSession(userAdvisorProtected)
+        activateAdvisorSession(userAdvisorProtected)
+        db.prepare(`
+            INSERT INTO report_sessions (user_jid, state, latitude, longitude, updated_at)
+            VALUES (?, 'AWAITING_LOCATION', NULL, NULL, datetime('now', '-16 minutes'))
+        `).run(userAdvisorProtected)
+
+        const mockSock50 = createMockSocket()
+        await cleanupExpiredSessionsAndFiles(mockSock50)
+
+        // El usuario normal debe haber expirado y recibido aviso
+        const normalAfter = db.prepare('SELECT * FROM report_sessions WHERE user_jid = ?').get(userNormalExp)
+        assert.strictEqual(normalAfter, undefined, 'La sesión normal debe ser limpiada')
+        const normalSent = mockSock50.sentMessages.find(m => m.jid === userNormalExp)
+        assert.ok(normalSent, 'Debe enviar aviso de inactividad al usuario normal')
+
+        // El usuario en modo asesor NO debe haber recibido ningún mensaje y su estado de asesor permanece intacto
+        const advisorSent = mockSock50.sentMessages.find(m => m.jid === userAdvisorProtected)
+        assert.strictEqual(advisorSent, undefined, 'El usuario en modo asesor NO debe recibir aviso de expiración')
+        const advisorStatusAfter = getAdvisorSession(userAdvisorProtected)
+        assert.strictEqual(advisorStatusAfter.status, 'ACTIVE', 'El modo asesor no debe ser alterado por el cleaner')
+        console.log('  ✅ Test 50 aprobado: Cleaner de 15m opera para usuarios normales y protege a asesores.\n')
+        passedTests++
+
+        // --------------------------------------------------------------------------
+        // Test 51: No se pierden ni modifican reportes previamente confirmados
+        // --------------------------------------------------------------------------
+        console.log('▶️ Test 51: Reportes previamente confirmados permanecen intactos ante intervención...')
+        const userConfirmed = '595989990052@s.whatsapp.net'
+        deleteSession(userConfirmed)
+        clearAdvisorSession(userConfirmed)
+
+        const confirmedReportId = 'rep_confirmed_manual_51'
+        const fakePhoto51 = path.join(UPLOADS_DIR, 'photo_confirmed_51.jpg')
+        fs.writeFileSync(fakePhoto51, 'CONFIRMED_DATA')
+
+        // Insertar reporte previamente auto-guardado en pending_sync_reports
+        db.prepare(`
+            INSERT INTO pending_sync_reports (id, user_jid, latitude, longitude, photo_path, description, status, attempts, next_retry_at, created_at, updated_at)
+            VALUES (?, ?, -25.29, -57.65, ?, 'Muro caído por raudal', 'PENDING', 0, 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+        `).run(confirmedReportId, userConfirmed, fakePhoto51)
+
+        // Sesión activa que apuntaba a ese reporte
+        db.prepare(`
+            INSERT INTO report_sessions (user_jid, state, latitude, longitude, photo_path, description, report_id, updated_at)
+            VALUES (?, 'AWAITING_DESCRIPTION', -25.29, -57.65, ?, 'Muro caído por raudal', ?, datetime('now'))
+        `).run(userConfirmed, fakePhoto51, confirmedReportId)
+
+        const mockSock51 = createMockSocket()
+        // Asesor interviene manualmente
+        await handleFloodReportFlow(mockSock51, userConfirmed, {
+            key: { remoteJid: userConfirmed, id: '3EB0_MANUAL_51', fromMe: true },
+            message: { conversation: 'Hola, veo que enviaste la foto del muro. Te habla el asesor.' }
+        })
+
+        // El reporte en pending_sync_reports debe permanecer exactamente igual
+        const pendingCheck51 = db.prepare('SELECT * FROM pending_sync_reports WHERE id = ?').get(confirmedReportId)
+        assert.ok(pendingCheck51, 'El reporte confirmado debe permanecer intacto')
+        assert.strictEqual(pendingCheck51.description, 'Muro caído por raudal')
+        assert.ok(fs.existsSync(fakePhoto51), 'La foto del reporte confirmado no debe eliminarse')
+        console.log('  ✅ Test 51 aprobado: Reportes confirmados 100% resguardados ante intervención de asesor.\n')
+        passedTests++
+
+        // --------------------------------------------------------------------------
+        // Test 52: Descarte de borrador incompleto al activar modo asesor
+        // --------------------------------------------------------------------------
+        console.log('▶️ Test 52: Borrador incompleto previo es descartado junto a su foto temporal...')
+        const userDraft = '595989990053@s.whatsapp.net'
+        deleteSession(userDraft)
+        clearAdvisorSession(userDraft)
+
+        const draftPhoto = path.join(UPLOADS_DIR, 'photo_draft_incomplete_52.jpg')
+        fs.writeFileSync(draftPhoto, 'DRAFT_PHOTO_DATA')
+
+        // Sesión incompleta (sin report_id asignado)
+        db.prepare(`
+            INSERT INTO report_sessions (user_jid, state, latitude, longitude, photo_path, report_id, updated_at)
+            VALUES (?, 'AWAITING_PHOTO', -25.29, -57.65, ?, NULL, datetime('now'))
+        `).run(userDraft, draftPhoto)
+
+        const mockSock52 = createMockSocket()
+        // Asesor interviene
+        await handleFloodReportFlow(mockSock52, userDraft, {
+            key: { remoteJid: userDraft, id: '3EB0_MANUAL_52', fromMe: true },
+            message: { conversation: 'Hola, te habla el asesor. No hace falta que subas la foto.' }
+        })
+
+        // La foto temporal del borrador incompleto debe haberse eliminado
+        assert.strictEqual(fs.existsSync(draftPhoto), false, 'La foto temporal del borrador incompleto debe ser eliminada')
+        // La sesión en report_sessions debe haber sido removida
+        const sessDraftAfter = db.prepare('SELECT * FROM report_sessions WHERE user_jid = ?').get(userDraft)
+        assert.strictEqual(sessDraftAfter, undefined, 'El borrador incompleto debe ser descartado')
+        console.log('  ✅ Test 52 aprobado: Borrador incompleto y archivo temporal descartados correctamente.\n')
+        passedTests++
+
+        // --------------------------------------------------------------------------
+        // Test 53: Vencimiento de seguridad de atención manual tras 2 horas de inactividad
+        // --------------------------------------------------------------------------
+        console.log('▶️ Test 53: Vencimiento de seguridad: 2 horas de inactividad liberan sesión de asesor...')
+        const userT53 = '595989990053_timeout@s.whatsapp.net'
+        deleteSession(userT53)
+        clearAdvisorSession(userT53)
+
+        // Activar asesor con más de 2 horas de inactividad (121 minutos atrás)
+        const twoHoursAgo53 = Date.now() - (121 * 60 * 1000)
+        activateAdvisorSession(userT53, twoHoursAgo53)
+
+        // Verificar que el cleaner periódicamente detecte la inactividad y libere la sesión
+        const mockSock53a = createMockSocket()
+        await cleanupExpiredSessionsAndFiles(mockSock53a)
+
+        const advAfterCleaner = getAdvisorSession(userT53)
+        assert.strictEqual(advAfterCleaner, null, 'El cleaner de mantenimiento debe liberar la sesión de asesor tras 2 horas')
+
+        // También probar cuando el ciudadano vuelve a escribir tras 2 horas de silencio
+        activateAdvisorSession(userT53, twoHoursAgo53)
+        const mockSock53b = createMockSocket()
+        await handleFloodReportFlow(mockSock53b, userT53, {
+            key: { remoteJid: userT53, id: 'MSG_T53_AFTER_2H' },
+            message: { conversation: 'Hola de nuevo' }
+        })
+
+        // Debe haber iniciado el flujo automático normal con bienvenida
+        assert.ok(mockSock53b.sentMessages.length >= 2, 'Debe reactivar el bot con bienvenida tras 2h de inactividad')
+        assert.ok(mockSock53b.sentMessages[0].content.text.includes('Sistema de Monitoreo de Inundaciones'))
+        const advAfterMsg = getAdvisorSession(userT53)
+        assert.strictEqual(advAfterMsg, null, 'La sesión de asesor debe haber quedado completamente eliminada')
+        console.log('  ✅ Test 53 aprobado: Límite de seguridad de 2 horas libera automáticamente la sesión.\n')
+        passedTests++
+
+        // --------------------------------------------------------------------------
         // Resumen
         // --------------------------------------------------------------------------
         console.log('==============================================================================')
-        console.log(`🎉 BATERÍA COMPLETA: ${passedTests} de 31 pruebas aprobadas exitosamente.`)
+        console.log(`🎉 BATERÍA COMPLETA: ${passedTests} de 53 pruebas aprobadas exitosamente.`)
         console.log('🛡️ Aislamiento verificado: sessions.db y uploads/ reales no sufrieron modificaciones.')
         console.log('==============================================================================\n')
     } finally {
