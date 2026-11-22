@@ -1802,157 +1802,233 @@ async function handleFloodReportFlow(sock, sender, msg, customDependencies = nul
     return false
 }
 
+// Control de reconexión y concurrencia
+let isConnecting = false
+let reconnectTimeout = null
+
 // Conexión principal con Baileys
 async function connectToWhatsApp() {
-    console.log('🔄 Iniciando FloodBot con Baileys...')
+    if (isConnecting) {
+        console.log('⚠️ Conexión en curso. Intento simultáneo ignorado.')
+        return global.activeSock
+    }
+    isConnecting = true
 
-    // Mantenimiento de arranque: purga silenciosa de sesiones expiradas y archivos huérfanos
-    cleanupExpiredSessionsAndFiles()
-
-    // Sincronizar reportes pendientes que hayan quedado de sesiones anteriores
-    triggerSyncPendingReports().catch(e => addLog('error', `Error al sincronizar reportes pendientes en arranque: ${e.message}`))
-
-    // Programar limpieza periódica cada 1 minuto en segundo plano (revisa sesiones con >15 min de inactividad)
-    if (!global.cleanupInterval) {
-        global.cleanupInterval = setInterval(() => {
-            cleanupExpiredSessionsAndFiles().catch(e => addLog('error', `Error en intervalo de limpieza: ${e.message}`))
-        }, 60 * 1000)
+    if (reconnectTimeout) {
+        clearTimeout(reconnectTimeout)
+        reconnectTimeout = null
     }
 
-    // Programar reintento periódico de reportes pendientes cada 30 segundos
-    if (!global.syncInterval) {
-        global.syncInterval = setInterval(() => {
-            triggerSyncPendingReports().catch(e => addLog('error', `Error en intervalo de sincronización: ${e.message}`))
-        }, 30 * 1000)
+    // Cierre limpio de socket previo para evitar acumulación de conexiones
+    if (global.activeSock) {
+        try {
+            global.activeSock.ws?.close()
+            global.activeSock.end?.(new Error('SOCKET_RECONNECT'))
+        } catch (_) { }
+        global.activeSock = null
     }
 
-    const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR)
+    try {
+        console.log('🔄 Iniciando FloodBot con Baileys...')
 
-    const sock = makeWASocket({
-        auth: state,
-        printQRInTerminal: false,
-        browser: Browsers.ubuntu('Chrome'),
-        logger: pino({ level: 'silent' })
-    })
+        // Mantenimiento de arranque: purga silenciosa de sesiones expiradas y archivos huérfanos
+        cleanupExpiredSessionsAndFiles()
 
-    // Asignar el socket activo a la cola de salida y referencia global
-    defaultQueue.setSocket(sock)
-    global.activeSock = sock
+        // Sincronizar reportes pendientes que hayan quedado de sesiones anteriores
+        triggerSyncPendingReports().catch(e => addLog('error', `Error al sincronizar reportes pendientes en arranque: ${e.message}`))
 
-    // Vinculación segura por consola si el número no está registrado aún
-    if (!state.creds.registered) {
-        console.log('\n======================================================')
-        console.log('📱 WHATSAPP NO ESTÁ VINCULADO')
-        console.log('======================================================')
-        const phoneNumber = await askQuestion('👉 Ingresá tu número con código de país (ej: 54911xxxxxxxx): ')
-        const cleanNumber = phoneNumber.replace(/\D/g, '')
-
-        if (cleanNumber) {
-            setTimeout(async () => {
-                try {
-                    const pairingCode = await sock.requestPairingCode(cleanNumber)
-                    console.log('\n======================================================')
-                    console.log(`🔑 CÓDIGO DE VINCULACIÓN: ${pairingCode}`)
-                    console.log('👉 Abrí WhatsApp en tu celular:')
-                    console.log('   Dispositivos vinculados > Vincular dispositivo > Vincular con número')
-                    console.log('======================================================\n')
-                } catch (err) {
-                    console.error('❌ Error al solicitar código de vinculación:', err.message)
-                }
-            }, 3000)
+        // Programar limpieza periódica cada 1 minuto en segundo plano (revisa sesiones con >15 min de inactividad)
+        if (!global.cleanupInterval) {
+            global.cleanupInterval = setInterval(() => {
+                cleanupExpiredSessionsAndFiles().catch(e => addLog('error', `Error en intervalo de limpieza: ${e.message}`))
+            }, 60 * 1000)
         }
-    }
 
-    // Eventos de estado de conexión
-    sock.ev.on('connection.update', async (update) => {
-        const { connection, lastDisconnect } = update
+        // Programar reintento periódico de reportes pendientes cada 30 segundos
+        if (!global.syncInterval) {
+            global.syncInterval = setInterval(() => {
+                triggerSyncPendingReports().catch(e => addLog('error', `Error en intervalo de sincronización: ${e.message}`))
+            }, 30 * 1000)
+        }
 
-        if (connection === 'close') {
-            defaultQueue.pause()
+        const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR)
 
-            const statusCode = (lastDisconnect?.error instanceof Boom)
-                ? lastDisconnect.error.output?.statusCode
-                : lastDisconnect?.error?.statusCode || 'unknown'
-            const errorReason = lastDisconnect?.error?.message || String(lastDisconnect?.error || 'Sin detalle')
+        const sock = makeWASocket({
+            auth: state,
+            printQRInTerminal: false,
+            browser: Browsers.ubuntu('Chrome'),
+            logger: pino({ level: 'silent' })
+        })
 
-            const shouldReconnect = statusCode !== DisconnectReason.loggedOut
+        // Asignar el socket activo a la cola de salida y referencia global
+        defaultQueue.setSocket(sock)
+        global.activeSock = sock
 
-            console.log(`⚠️ Conexión cerrada (Código: ${statusCode}, Motivo: ${errorReason})`)
-
-            if (shouldReconnect) {
-                console.log('🔄 Reconectando en 5 segundos...')
-                setTimeout(connectToWhatsApp, 5000)
-            } else {
-                console.log('⚠️ La sesión fue cerrada por WhatsApp o requiere reautenticación.')
-                console.log('ℹ️ No se eliminan credenciales locales automáticamente.')
-            }
-        } else if (connection === 'connecting') {
-            console.log('⏳ Conectando con los servidores de WhatsApp...')
-        } else if (connection === 'open') {
-            defaultQueue.setSocket(sock)
-            defaultQueue.resume()
-
-            const botNumber = sock.user?.id?.split(':')[0] || sock.user?.id?.split('@')[0] || 'Desconocido'
+        // Vinculación segura por consola si el número no está registrado aún
+        if (!state.creds.registered) {
             console.log('\n======================================================')
-            console.log(`✅ WHATSAPP CONECTADO EXITOSAMENTE`)
-            console.log(`📞 Número de Bot: +${botNumber}`)
-            if (isSupabaseConfigured()) {
-                console.log(`☁️ Supabase Cloud Storage & DB: HABILITADO`)
-            } else {
-                console.log(`⚠️ Supabase: NO CONFIGURADO en .env`)
-            }
-            console.log('🤖 FloodBot listo para recibir reportes de ciudadanos.')
-            console.log('======================================================\n')
-        }
-    })
+            console.log('📱 WHATSAPP NO ESTÁ VINCULADO')
+            console.log('======================================================')
+            if (process.stdin.isTTY) {
+                const phoneNumber = await askQuestion('👉 Ingresá tu número con código de país (ej: 54911xxxxxxxx): ')
+                const cleanNumber = phoneNumber.replace(/\D/g, '')
 
-    // Guardado automático de credenciales actualizadas
-    sock.ev.on('creds.update', saveCreds)
-
-    // Manejador de mensajes entrantes y eventos de sincronización
-    sock.ev.on('messages.upsert', async ({ messages, type }) => {
-        // Ignorar eventos que no sean notificaciones en vivo
-        if (type !== 'notify' && type !== 'append') return
-
-        const nowSec = Math.floor(Date.now() / 1000)
-
-        for (const msg of messages) {
-            if (!msg.message) continue
-
-            const sender = msg.key.remoteJid
-            // Solo procesar mensajes de usuarios individuales (ignorar grupos, broadcast y canales)
-            if (sender.endsWith('@g.us') || sender.endsWith('@broadcast') || sender.endsWith('@newsletter')) continue
-
-            // Protección contra mensajes antiguos encolados o duplicados durante reconexión
-            // Si el mensaje tiene más de 5 minutos de antigüedad respecto a la hora actual, se descarta
-            const msgTimestamp = Number(msg.messageTimestamp || 0)
-            if (msgTimestamp > 0 && (nowSec - msgTimestamp) > 300) {
-                continue
-            }
-
-            // Deduplicación por ID de mensaje para evitar procesar dos veces el mismo mensaje
-            if (!global.processedMsgIds) global.processedMsgIds = new Set()
-            const msgId = msg.key?.id
-            if (msgId) {
-                if (global.processedMsgIds.has(msgId)) continue
-                global.processedMsgIds.add(msgId)
-                if (global.processedMsgIds.size > 500) {
-                    const firstItem = global.processedMsgIds.values().next().value
-                    global.processedMsgIds.delete(firstItem)
+                if (cleanNumber) {
+                    setTimeout(async () => {
+                        try {
+                            const pairingCode = await sock.requestPairingCode(cleanNumber)
+                            console.log('\n======================================================')
+                            console.log(`🔑 CÓDIGO DE VINCULACIÓN: ${pairingCode}`)
+                            console.log('👉 Abrí WhatsApp en tu celular:')
+                            console.log('   Dispositivos vinculados > Vincular dispositivo > Vincular con número')
+                            console.log('======================================================\n')
+                        } catch (err) {
+                            console.error('❌ Error al solicitar código de vinculación:', err.message)
+                        }
+                    }, 3000)
                 }
+            } else {
+                console.log('📱 Terminal no interactiva (servicio en segundo plano). Ejecutá interactivamente "node bot.js" para vincular.')
             }
-
-            await handleFloodReportFlow(sock, sender, msg)
         }
-    })
 
-    return sock
+        // Eventos de estado de conexión
+        sock.ev.on('connection.update', async (update) => {
+            const { connection, lastDisconnect } = update
+
+            if (connection === 'close') {
+                isConnecting = false
+                defaultQueue.pause()
+
+                const statusCode = (lastDisconnect?.error instanceof Boom)
+                    ? lastDisconnect.error.output?.statusCode
+                    : lastDisconnect?.error?.statusCode || 'unknown'
+                const errorReason = lastDisconnect?.error?.message || String(lastDisconnect?.error || 'Sin detalle')
+
+                const shouldReconnect = statusCode !== DisconnectReason.loggedOut
+
+                console.log(`⚠️ Conexión cerrada (Código: ${statusCode}, Motivo: ${errorReason})`)
+
+                if (shouldReconnect) {
+                    console.log('🔄 Reconectando en 5 segundos...')
+                    if (reconnectTimeout) clearTimeout(reconnectTimeout)
+                    reconnectTimeout = setTimeout(() => {
+                        connectToWhatsApp().catch(err => console.error('Error en reconexión:', err.message))
+                    }, 5000)
+                } else {
+                    console.log('⚠️ La sesión fue cerrada por WhatsApp (loggedOut). Requiere re-vinculación manual.')
+                    console.log('ℹ️ No se eliminan credenciales locales automáticamente.')
+                }
+            } else if (connection === 'connecting') {
+                console.log('⏳ Conectando con los servidores de WhatsApp...')
+            } else if (connection === 'open') {
+                isConnecting = false
+                if (reconnectTimeout) {
+                    clearTimeout(reconnectTimeout)
+                    reconnectTimeout = null
+                }
+                defaultQueue.setSocket(sock)
+                defaultQueue.resume()
+
+                const botNumber = sock.user?.id?.split(':')[0] || sock.user?.id?.split('@')[0] || 'Desconocido'
+                console.log('\n======================================================')
+                console.log(`✅ WHATSAPP CONECTADO EXITOSAMENTE`)
+                console.log(`📞 Número de Bot: +${botNumber}`)
+                if (isSupabaseConfigured()) {
+                    console.log(`☁️ Supabase Cloud Storage & DB: HABILITADO`)
+                } else {
+                    console.log(`⚠️ Supabase: NO CONFIGURADO en .env`)
+                }
+                console.log('🤖 FloodBot listo para recibir reportes de ciudadanos.')
+                console.log('======================================================\n')
+            }
+        })
+
+        // Guardado automático de credenciales actualizadas
+        sock.ev.on('creds.update', saveCreds)
+
+        // Manejador de mensajes entrantes y eventos de sincronización
+        sock.ev.on('messages.upsert', async ({ messages, type }) => {
+            // Ignorar eventos que no sean notificaciones en vivo
+            if (type !== 'notify' && type !== 'append') return
+
+            const nowSec = Math.floor(Date.now() / 1000)
+
+            for (const msg of messages) {
+                if (!msg.message) continue
+
+                const sender = msg.key.remoteJid
+                // Solo procesar mensajes de usuarios individuales (ignorar grupos, broadcast y canales)
+                if (sender.endsWith('@g.us') || sender.endsWith('@broadcast') || sender.endsWith('@newsletter')) continue
+
+                // Protección contra mensajes antiguos encolados o duplicados durante reconexión
+                // Si el mensaje tiene más de 5 minutos de antigüedad respecto a la hora actual, se descarta
+                const msgTimestamp = Number(msg.messageTimestamp || 0)
+                if (msgTimestamp > 0 && (nowSec - msgTimestamp) > 300) {
+                    continue
+                }
+
+                // Deduplicación por ID de mensaje para evitar procesar dos veces el mismo mensaje
+                if (!global.processedMsgIds) global.processedMsgIds = new Set()
+                const msgId = msg.key?.id
+                if (msgId) {
+                    if (global.processedMsgIds.has(msgId)) continue
+                    global.processedMsgIds.add(msgId)
+                    if (global.processedMsgIds.size > 500) {
+                        const firstItem = global.processedMsgIds.values().next().value
+                        global.processedMsgIds.delete(firstItem)
+                    }
+                }
+
+                await handleFloodReportFlow(sock, sender, msg)
+            }
+        })
+
+        return sock
+    } catch (err) {
+        isConnecting = false
+        console.error('Error al inicializar conexión con WhatsApp:', err.message)
+        if (reconnectTimeout) clearTimeout(reconnectTimeout)
+        reconnectTimeout = setTimeout(() => {
+            connectToWhatsApp().catch(e => console.error('Error en reintento programado:', e.message))
+        }, 5000)
+        return null
+    } finally {
+        isConnecting = false
+    }
 }
 
 function closeDatabase() {
     try {
         db.close()
     } catch (_) { }
+}
+
+// Apagado seguro ante señales del sistema operativo (systemctl stop/restart y Ctrl+C)
+if (process.env.NODE_ENV !== 'test') {
+    process.on('SIGTERM', () => {
+        console.log('🛑 Señal SIGTERM recibida. Cerrando FloodBot de forma segura...')
+        try {
+            if (reconnectTimeout) clearTimeout(reconnectTimeout)
+            if (global.activeSock) {
+                try {
+                    global.activeSock.ws?.close()
+                    global.activeSock.end?.()
+                } catch (_) { }
+                global.activeSock = null
+            }
+            closeDatabase()
+        } catch (err) {
+            console.error('Error durante el apagado seguro:', err)
+        }
+        process.exit(0)
+    })
+
+    process.on('SIGINT', () => {
+        console.log('🛑 Deteniendo FloodBot (Ctrl+C)...')
+        try { closeDatabase() } catch (_) { }
+        process.exit(0)
+    })
 }
 
 // Exportación para suite de pruebas
@@ -2003,7 +2079,11 @@ if (process.env.NODE_ENV === 'test') {
         DECISION_INTERFACE_MODE: null,
         sendContinueOrCancelInterface: null,
         EXPERIMENTAL_BUTTONS_ENABLED: false,
-        sendContinueOrCancelButtons: null
+        sendContinueOrCancelButtons: null,
+        connectToWhatsApp,
+        getIsConnecting: () => isConnecting,
+        setIsConnecting: (val) => { isConnecting = val },
+        getReconnectTimeout: () => reconnectTimeout
     }
 }
 

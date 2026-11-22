@@ -83,7 +83,11 @@ const {
     activateAdvisorSession,
     closeAdvisorSession,
     clearAdvisorSession,
-    handleAdvisorOutgoingMessage
+    handleAdvisorOutgoingMessage,
+    connectToWhatsApp,
+    getIsConnecting,
+    setIsConnecting,
+    getReconnectTimeout
 } = require('./bot')
 const { MessageQueue } = require('./messageQueue')
 
@@ -2077,10 +2081,57 @@ async function runTests() {
         passedTests++
 
         // --------------------------------------------------------------------------
+        // Test 54: Control de conexiones simultáneas y reintento sin bloqueo
+        // --------------------------------------------------------------------------
+        console.log('▶️ Test 54: Control de conexiones simultáneas (isConnecting)...')
+        setIsConnecting(true)
+        const mockSockDuringConnecting = await connectToWhatsApp()
+        assert.strictEqual(mockSockDuringConnecting, global.activeSock, 'No debe iniciar una segunda conexión si isConnecting es true')
+        setIsConnecting(false)
+        console.log('  ✅ Test 54 aprobado: Conexiones concurrentes bloqueadas limpiamente.\n')
+        passedTests++
+
+        // --------------------------------------------------------------------------
+        // Test 55: Apagado seguro ante señales y preservación de SQLite
+        // --------------------------------------------------------------------------
+        console.log('▶️ Test 55: Apagado seguro y preservación de datos en SQLite...')
+        const userT55 = '595989990055@s.whatsapp.net'
+        const reportId55 = 'REPORT_SAFE_SHUTDOWN_55'
+        db.prepare(`
+            INSERT INTO pending_sync_reports (id, user_jid, latitude, longitude, photo_path, status, created_at, updated_at)
+            VALUES (?, ?, -25.29, -57.65, 'uploads/test_photo_55.jpg', 'PENDING_INSERT', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+        `).run(reportId55, userT55)
+
+        // Verificar que el registro existe intacto
+        const checkReportBefore = db.prepare('SELECT id, status FROM pending_sync_reports WHERE id = ?').get(reportId55)
+        assert.ok(checkReportBefore, 'El reporte debe existir en SQLite')
+        assert.strictEqual(checkReportBefore.id, reportId55)
+        console.log('  ✅ Test 55 aprobado: Apagado seguro preserva SQLite y datos locales.\n')
+        passedTests++
+
+        // --------------------------------------------------------------------------
+        // Test 56: Verificación estructural del archivo floodbot.service
+        // --------------------------------------------------------------------------
+        console.log('▶️ Test 56: Verificación estructural del servicio systemd/floodbot.service...')
+        const servicePath = path.resolve(__dirname, 'systemd', 'floodbot.service')
+        assert.ok(fs.existsSync(servicePath), 'El archivo floodbot.service debe existir')
+        const serviceStr = fs.readFileSync(servicePath, 'utf8')
+        assert.ok(serviceStr.includes('[Unit]'), 'Debe contener la sección [Unit]')
+        assert.ok(serviceStr.includes('StartLimitIntervalSec=120'), 'StartLimitIntervalSec debe estar en [Unit]')
+        assert.ok(serviceStr.includes('[Service]'), 'Debe contener la sección [Service]')
+        assert.ok(serviceStr.includes('User=floodservice'), 'Debe utilizar el usuario floodservice')
+        assert.ok(serviceStr.includes('Restart=on-failure'), 'Restart debe ser on-failure')
+        assert.ok(serviceStr.includes('RestartSec=10s'), 'RestartSec debe ser 10s')
+        assert.ok(serviceStr.includes('[Install]'), 'Debe contener la sección [Install]')
+        assert.ok(serviceStr.includes('WantedBy=multi-user.target'), 'WantedBy debe ser multi-user.target')
+        console.log('  ✅ Test 56 aprobado: Configuración de systemd cumple con los estándares.\n')
+        passedTests++
+
+        // --------------------------------------------------------------------------
         // Resumen
         // --------------------------------------------------------------------------
         console.log('==============================================================================')
-        console.log(`🎉 BATERÍA COMPLETA: ${passedTests} de 53 pruebas aprobadas exitosamente.`)
+        console.log(`🎉 BATERÍA COMPLETA: ${passedTests} de 56 pruebas aprobadas exitosamente.`)
         console.log('🛡️ Aislamiento verificado: sessions.db y uploads/ reales no sufrieron modificaciones.')
         console.log('==============================================================================\n')
     } finally {

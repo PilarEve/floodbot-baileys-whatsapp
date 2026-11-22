@@ -1,0 +1,60 @@
+
+[Unit]
+Description=FloodBot - Servicio de WhatsApp para Monitoreo de Inundaciones Urbanas
+Documentation=https://github.com/usuario/floodbot-baileys-whatsapp
+After=network.target network-online.target
+Wants=network-online.target
+
+# ==============================================================================
+# Protección contra bucles infinitos de reinicio (máximo 5 reinicios en 120 segundos)
+# En systemd moderno (>= 230), estas directivas pertenecen a la sección [Unit]
+# ==============================================================================
+StartLimitIntervalSec=120
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=floodservice
+Group=floodservice
+
+# ==============================================================================
+# Parámetros Configurables de Rutas (Ajustar según instalación real en el servidor)
+# ==============================================================================
+# Directorio raíz del proyecto clonado
+WorkingDirectory=/home/floodservice/floodbot-baileys-whatsapp
+
+# Comando de inicio: buscar ruta de Node con 'which node' si difiere de /usr/bin/node
+ExecStart=/usr/bin/node bot.js
+
+# Cargar variables de entorno desde el archivo .env de producción
+EnvironmentFile=-/home/floodservice/floodbot-baileys-whatsapp/.env
+Environment=NODE_ENV=production
+
+# ==============================================================================
+# Políticas de Recuperación Automática y Resiliencia
+# ==============================================================================
+# Reinicio automático ante terminación con error o caídas no planificadas
+Restart=on-failure
+RestartSec=10s
+
+# ==============================================================================
+# Prevención de Instancias Múltiples y Gestión de Recursos
+# ==============================================================================
+# Límite amplio de descriptores para SQLite y WebSockets
+LimitNOFILE=65535
+
+# Registro de logs centralizado en systemd-journald (consultable con journalctl)
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=floodbot
+
+# Permisos de escritura estrictamente acotados a los datos locales
+ReadWritePaths=/home/floodservice/floodbot-baileys-whatsapp
+
+# Endurecimiento de seguridad
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=false
+
+[Install]
+WantedBy=multi-user.target
