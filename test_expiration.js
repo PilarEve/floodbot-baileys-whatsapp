@@ -2128,10 +2128,211 @@ async function runTests() {
         passedTests++
 
         // --------------------------------------------------------------------------
+        // Test 57: Descarte de paquetes internos de WhatsApp sin sesión previa (evita bienvenida espontánea del 21/11)
+        // --------------------------------------------------------------------------
+        console.log('▶️ Test 57: Descarte de paquetes de protocolo sin texto / sin sesión previa...')
+        const userT57 = '595989990057@s.whatsapp.net'
+        deleteSession(userT57)
+        clearAdvisorSession(userT57)
+
+        const mockSock57 = createMockSocket()
+        // Paquete de protocolo interno de WhatsApp (sin texto ni ubicación ni foto)
+        const protoMsg57 = {
+            key: { remoteJid: userT57, id: 'PROTO_MSG_57', fromMe: false },
+            message: {
+                senderKeyDistributionMessage: { groupId: 'status@broadcast' },
+                messageContextInfo: {}
+            }
+        }
+        const result57 = await handleFloodReportFlow(mockSock57, userT57, protoMsg57)
+        assert.strictEqual(result57, false, 'El manejador debe descartar silenciosamente paquetes de protocolo sin texto')
+        assert.strictEqual(mockSock57.sentMessages.length, 0, 'No debe enviar ningún mensaje al ciudadano ante paquetes de protocolo')
+        const sessionAfter57 = db.prepare('SELECT * FROM report_sessions WHERE user_jid = ?').get(userT57)
+        assert.strictEqual(sessionAfter57, undefined, 'No debe crearse ninguna sesión en SQLite')
+        console.log('  ✅ Test 57 aprobado: Paquetes de protocolo descartados en silencio sin bienvenida espontánea.\n')
+        passedTests++
+
+        // --------------------------------------------------------------------------
+        // Test 58: Cancelación con 0 purga cola y no se reinicia ante paquetes de protocolo posteriores
+        // --------------------------------------------------------------------------
+        console.log('▶️ Test 58: Cancelación con 0 purga cola y no se reinicia ante paquetes posteriores...')
+        const userT58 = '595989990058@s.whatsapp.net'
+        deleteSession(userT58)
+        clearAdvisorSession(userT58)
+
+        // Sesión activa esperando ubicación
+        db.prepare(`
+            INSERT INTO report_sessions (user_jid, state, updated_at)
+            VALUES (?, 'AWAITING_LOCATION', datetime('now'))
+        `).run(userT58)
+
+        const mockSock58 = createMockSocket()
+        // Encolar mensaje previo demorado para verificar que se purga
+        defaultQueue.setSocket(mockSock58)
+        defaultQueue.enqueue(userT58, { text: 'Mensaje que debe cancelarse' })
+
+        // Ciudadano escribe 0 para cancelar
+        await handleFloodReportFlow(mockSock58, userT58, {
+            key: { remoteJid: userT58, id: 'CANCEL_MSG_58', fromMe: false },
+            message: { conversation: '0' }
+        })
+
+        // Debe haberse enviado el mensaje de cancelación
+        const cancelSent58 = mockSock58.sentMessages.find(m => m.content?.text?.includes('Reporte cancelado'))
+        assert.ok(cancelSent58, 'El mensaje de confirmación de cancelación debe ser despachado')
+
+        // Llega un paquete de protocolo de entrega / sync posterior
+        const protoMsg58 = {
+            key: { remoteJid: userT58, id: 'WA_ACK_58', fromMe: false },
+            message: { messageContextInfo: {} }
+        }
+        await handleFloodReportFlow(mockSock58, userT58, protoMsg58)
+
+        // La sesión debe seguir eliminada y no debe haberse enviado bienvenida
+        const sessionAfter58 = db.prepare('SELECT * FROM report_sessions WHERE user_jid = ?').get(userT58)
+        assert.strictEqual(sessionAfter58, undefined, 'La sesión debe permanecer cancelada')
+        const welcomeSent58 = mockSock58.sentMessages.find(m => m.content?.text?.includes('Sistema de Monitoreo de Inundaciones'))
+        assert.strictEqual(welcomeSent58, undefined, 'No debe reiniciar el flujo tras cancelar')
+        console.log('  ✅ Test 58 aprobado: Cancelación purga cola y permanece en silencio ante paquetes de red.\n')
+        passedTests++
+
+        // --------------------------------------------------------------------------
+        // Test 59: Expiración no genera bucle periódico de bienvenida (15 min loop)
+        // --------------------------------------------------------------------------
+        console.log('▶️ Test 59: Expiración por inactividad no genera bucle periódico de bienvenida...')
+        const userT59 = '595989990059@s.whatsapp.net'
+        deleteSession(userT59)
+        clearAdvisorSession(userT59)
+
+        // Sesión abandonada de hace 16 minutos
+        db.prepare(`
+            INSERT INTO report_sessions (user_jid, state, updated_at)
+            VALUES (?, 'AWAITING_LOCATION', datetime('now', '-16 minutes'))
+        `).run(userT59)
+
+        const mockSock59 = createMockSocket()
+        await cleanupExpiredSessionsAndFiles(mockSock59)
+
+        // Se envió el mensaje de expiración
+        const expireSent59 = mockSock59.sentMessages.find(m => m.jid === userT59 && m.content?.text?.includes('Conversación finalizada'))
+        assert.ok(expireSent59, 'Debe enviar aviso de conversación finalizada')
+
+        // WhatsApp emite paquete de acuse de recibo / delivery stub
+        await handleFloodReportFlow(mockSock59, userT59, {
+            key: { remoteJid: userT59, id: 'RECEIPT_STUB_59', fromMe: false },
+            message: { messageContextInfo: {} }
+        })
+
+        // No debe reabrir sesión ni enviar bienvenida
+        const sessionAfter59 = db.prepare('SELECT * FROM report_sessions WHERE user_jid = ?').get(userT59)
+        assert.strictEqual(sessionAfter59, undefined, 'No debe reabrir sesión tras expirar')
+        const welcomeSent59 = mockSock59.sentMessages.find(m => m.jid === userT59 && m.content?.text?.includes('Sistema de Monitoreo de Inundaciones'))
+        assert.strictEqual(welcomeSent59, undefined, 'No debe reiniciar bienvenida (bucle infinito prevenido)')
+        console.log('  ✅ Test 59 aprobado: Bucle infinito de expiración y bienvenida completamente erradicado.\n')
+        passedTests++
+
+        // --------------------------------------------------------------------------
+        // Test 60: Respeto estricto del estado COOLDOWN de 15 min tras cierre de asesor
+        // --------------------------------------------------------------------------
+        console.log('▶️ Test 60: Respeto del estado COOLDOWN de 15 min tras cierre de asesor...')
+        const userT60 = '595989990060@s.whatsapp.net'
+        deleteSession(userT60)
+        clearAdvisorSession(userT60)
+
+        // Encolar mensaje previo para comprobar que la cola se purga al cerrar el asesor
+        const mockSock60 = createMockSocket()
+        defaultQueue.setSocket(mockSock60)
+        defaultQueue.enqueue(userT60, { text: 'Mensaje pendiente en cola' })
+        assert.ok(defaultQueue.getQueueLength() > 0, 'La cola debe tener mensaje pendiente antes del cierre')
+
+        // El asesor cierra la conversación con "Gracias. Reporte recibido"
+        await handleFloodReportFlow(mockSock60, userT60, {
+            key: { remoteJid: userT60, id: 'ADVISOR_CLOSE_60', fromMe: true },
+            message: { conversation: 'Gracias. Reporte recibido' }
+        })
+
+        // La cola debe haber sido purgada para ese ciudadano
+        const pendingInQueue60 = defaultQueue.queue.find(item => item.jid === userT60)
+        assert.strictEqual(pendingInQueue60, undefined, 'Al cerrar asesor la cola debe purgarse para el ciudadano')
+
+        // La sesión de asesor debe estar en COOLDOWN
+        const advStatus60 = getAdvisorSession(userT60)
+        assert.ok(advStatus60, 'Debe existir sesión de asesor')
+        assert.strictEqual(advStatus60.status, 'COOLDOWN', 'El estado del asesor debe ser COOLDOWN')
+
+        // Verificar que un paquete de protocolo saliente (fromMe: true sin texto ni imagen) no altere ni active asesor
+        await handleFloodReportFlow(mockSock60, userT60, {
+            key: { remoteJid: userT60, id: 'PROTO_OUT_60', fromMe: true },
+            message: { senderKeyDistributionMessage: { groupId: '123' }, messageContextInfo: {} }
+        })
+        const advStatusAfterProto60 = getAdvisorSession(userT60)
+        assert.strictEqual(advStatusAfterProto60.status, 'COOLDOWN', 'Un paquete de protocolo saliente no debe activar modo asesor')
+
+        // Simular que en report_sessions quedó un registro antiguo (ej: de hace 20 minutos)
+        db.prepare(`
+            INSERT INTO report_sessions (user_jid, state, updated_at)
+            VALUES (?, 'AWAITING_LOCATION', datetime('now', '-20 minutes'))
+        `).run(userT60)
+
+        // Ejecutar cleaner de expiración
+        await cleanupExpiredSessionsAndFiles(mockSock60)
+
+        // Durante COOLDOWN, FloodBot no debe enviar ningún mensaje de expiración al ciudadano
+        const expireSent60 = mockSock60.sentMessages.find(m => m.jid === userT60)
+        assert.strictEqual(expireSent60, undefined, 'NO debe enviar mensaje de expiración durante COOLDOWN')
+        console.log('  ✅ Test 60 aprobado: Estado COOLDOWN respetado; silencio absoluto garantizado.\n')
+        passedTests++
+
+        // --------------------------------------------------------------------------
+        // Test 61: Cierre de asesor preserva reportes válidos con foto para Supabase
+        // --------------------------------------------------------------------------
+        console.log('▶️ Test 61: Cierre de asesor preserva reportes válidos y fotos en SQLite y disco...')
+        const userT61 = '595989990061@s.whatsapp.net'
+        deleteSession(userT61)
+        clearAdvisorSession(userT61)
+
+        const repId61 = 'REP_VALID_ADVISOR_61'
+        const fakePhoto61 = path.join(UPLOADS_DIR, 'photo_valid_advisor_61.jpg')
+        fs.writeFileSync(fakePhoto61, 'PHOTO_BINARY_DATA_61')
+
+        // Reporte válido auto-guardado en pending_sync_reports
+        db.prepare(`
+            INSERT INTO pending_sync_reports (id, user_jid, latitude, longitude, photo_path, description, status, attempts, next_retry_at, created_at, updated_at)
+            VALUES (?, ?, -25.30, -57.60, ?, 'Agua acumulada en esquina', 'PENDING', 0, 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+        `).run(repId61, userT61, fakePhoto61)
+
+        // Sesión activa con el reporte asociado
+        db.prepare(`
+            INSERT INTO report_sessions (user_jid, state, latitude, longitude, photo_path, description, report_id, updated_at)
+            VALUES (?, 'AWAITING_DESCRIPTION', -25.30, -57.60, ?, 'Agua acumulada en esquina', ?, datetime('now'))
+        `).run(userT61, fakePhoto61, repId61)
+
+        // El asesor envía "Gracias. Reporte recibido"
+        const mockSock61 = createMockSocket()
+        await handleFloodReportFlow(mockSock61, userT61, {
+            key: { remoteJid: userT61, id: 'ADVISOR_CLOSE_61', fromMe: true },
+            message: { conversation: 'Gracias. Reporte recibido' }
+        })
+
+        // Verificar que el diálogo conversacional se cerró para evitar duplicaciones
+        const sessionAfter61 = db.prepare('SELECT * FROM report_sessions WHERE user_jid = ?').get(userT61)
+        assert.strictEqual(sessionAfter61, undefined, 'La sesión conversacional debe cerrarse limpiamente')
+
+        // Verificar que el archivo de foto en disco NO fue borrado
+        assert.ok(fs.existsSync(fakePhoto61), 'La fotografía en disco debe permanecer intacta')
+
+        // Verificar que el reporte en pending_sync_reports NO fue eliminado
+        const pending61 = db.prepare('SELECT * FROM pending_sync_reports WHERE id = ?').get(repId61)
+        assert.ok(pending61, 'El reporte en pending_sync_reports debe permanecer intacto para sincronización')
+        assert.strictEqual(pending61.photo_path, fakePhoto61)
+        console.log('  ✅ Test 61 aprobado: Reporte y fotografía preservados al cerrar asesor.\n')
+        passedTests++
+
+        // --------------------------------------------------------------------------
         // Resumen
         // --------------------------------------------------------------------------
         console.log('==============================================================================')
-        console.log(`🎉 BATERÍA COMPLETA: ${passedTests} de 56 pruebas aprobadas exitosamente.`)
+        console.log(`🎉 BATERÍA COMPLETA: ${passedTests} de 61 pruebas aprobadas exitosamente.`)
         console.log('🛡️ Aislamiento verificado: sessions.db y uploads/ reales no sufrieron modificaciones.')
         console.log('==============================================================================\n')
     } finally {

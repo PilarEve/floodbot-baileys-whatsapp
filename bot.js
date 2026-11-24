@@ -264,22 +264,35 @@ async function cleanupExpiredSessionsAndFiles(customSock = null) {
         // 1. Sesiones de conversación activas
         const allSessions = db.prepare('SELECT user_jid, photo_path, report_id, updated_at FROM report_sessions').all()
         for (const s of allSessions) {
-            // Si la conversación está en atención manual por asesor, verificar si superó las 2 horas de inactividad
+            // Si la conversación está en atención manual por asesor o en cooldown post-asesor, no expirar
             const advisor = getAdvisorSession(s.user_jid)
-            if (advisor && advisor.status === 'ACTIVE') {
-                if (isAdvisorSessionExpired(advisor)) {
-                    clearAdvisorSession(s.user_jid)
-                    addLog('info', `⏰ Atención manual expirada por inactividad (>2h) para ${s.user_jid}. Sesión de asesor liberada.`)
-                } else {
-                    if (s.photo_path) {
-                        try { activePhotoPaths.add(path.resolve(s.photo_path)) } catch (_) { }
+            if (advisor) {
+                if (advisor.status === 'ACTIVE') {
+                    if (isAdvisorSessionExpired(advisor)) {
+                        clearAdvisorSession(s.user_jid)
+                        addLog('info', `⏰ Atención manual expirada por inactividad (>2h) para ${s.user_jid}. Sesión de asesor liberada.`)
+                    } else {
+                        if (s.photo_path) {
+                            try { activePhotoPaths.add(path.resolve(s.photo_path)) } catch (_) { }
+                        }
+                        continue
                     }
-                    continue
+                } else if (advisor.status === 'COOLDOWN') {
+                    const elapsedMs = Date.now() - (advisor.closed_at_ms || 0)
+                    if (elapsedMs < (15 * 60 * 1000)) {
+                        if (s.photo_path) {
+                            try { activePhotoPaths.add(path.resolve(s.photo_path)) } catch (_) { }
+                        }
+                        continue
+                    } else {
+                        clearAdvisorSession(s.user_jid)
+                    }
                 }
             }
 
             if (isSessionExpired(s)) {
-                // Eliminar sesión conversacional de inmediato para que nunca se procese dos veces
+                // Cancelar mensajes pendientes en cola y eliminar sesión conversacional de inmediato
+                defaultQueue.cancelForJid(s.user_jid)
                 db.prepare('DELETE FROM report_sessions WHERE user_jid = ?').run(s.user_jid)
                 expiredCount++
 
@@ -1056,10 +1069,30 @@ async function handleAdvisorOutgoingMessage(sock, recipientJid, msg) {
         ''
     ).trim()
 
+    // Si el mensaje saliente no contiene texto ni imagen, es un paquete interno de WhatsApp (no activar modo asesor)
+    if (!text && !rawMsg?.imageMessage) {
+        return
+    }
+
     // 1. Comprobar si es el mensaje de finalización ("Gracias. Reporte recibido")
     if (isAdvisorClosingMessage(text)) {
+        defaultQueue.cancelForJid(recipientJid)
         closeAdvisorSession(recipientJid, Date.now())
         addLog('info', `Atención manual finalizada por asesor para ${recipientJid}. Cooldown de 15 min activado.`)
+        try {
+            const existingSession = db.prepare('SELECT state, photo_path, report_id FROM report_sessions WHERE user_jid = ?').get(recipientJid)
+            if (existingSession) {
+                if (existingSession.report_id) {
+                    deleteSessionWithoutPhoto(recipientJid)
+                    addLog('info', `Reporte confirmado ${existingSession.report_id} conservado para ${recipientJid}. Diálogo cerrado por asesor.`)
+                } else {
+                    if (existingSession.photo_path) {
+                        safeDeleteUploadFile(existingSession.photo_path)
+                    }
+                    db.prepare('DELETE FROM report_sessions WHERE user_jid = ?').run(recipientJid)
+                }
+            }
+        } catch (_) { }
         return
     }
 
@@ -1287,6 +1320,14 @@ async function handleFloodReportFlow(sock, sender, msg, customDependencies = nul
         return true
     }
 
+    // Descartar paquetes de protocolo de WhatsApp o notificaciones internas sin contenido útil
+    const hasLocation = Boolean(rawMsg.locationMessage || rawMsg.liveLocationMessage)
+    const hasImage = Boolean(rawMsg.imageMessage)
+    const hasPoll = Boolean(rawMsg.pollUpdateMessage)
+    if (!text && !hasLocation && !hasImage && !hasPoll) {
+        return false
+    }
+
     // 2. Si la conversación está en atención manual por asesor o en cooldown de 15 minutos
     const advisorSession = getAdvisorSession(sender)
     if (advisorSession) {
@@ -1378,6 +1419,7 @@ async function handleFloodReportFlow(sock, sender, msg, customDependencies = nul
 
     // 1. Cancelación o salida global en cualquier momento
     if (isCancelCommand) {
+        defaultQueue.cancelForJid(sender)
         if (session?.report_id) {
             const currentSession = db.prepare('SELECT latitude, longitude, selected_affectations, photo_path, description, report_id, storage_url FROM report_sessions WHERE user_jid = ?').get(sender) || session
             const summaryText = getReportSummaryText(currentSession)
@@ -1408,8 +1450,9 @@ async function handleFloodReportFlow(sock, sender, msg, customDependencies = nul
         return await startNewReport()
     }
 
-    // Si no hay sesión previa, iniciar con el primer mensaje
+    // Si no hay sesión previa, iniciar con el primer mensaje válido
     if (!session) {
+        if (!text && !hasLocation && !hasImage) return false
         return await startNewReport()
     }
 
